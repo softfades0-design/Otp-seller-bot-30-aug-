@@ -346,6 +346,36 @@ def get_mongo_available_inventory():
         return []
 
 
+def get_mongo_inventory_records(country=None, year=None, price=None, category=None, dc=None):
+    collection = mongo_inventory_collection()
+    if collection is None:
+        return []
+    query = {"available": 1}
+    if country is not None:
+        query["country_name"] = {"$regex": f"^{re.escape(str(country))}", "$options": "i"}
+    if year is not None:
+        query["account_year"] = int(year)
+    if price is not None:
+        query["price"] = int(price)
+    if category is not None:
+        category = normalize_optional_text(category)
+        if category:
+            query["category"] = category
+        else:
+            query["$or"] = [{"category": {"$in": [None, "", "Good"]}}, {"category": {"$exists": False}}]
+    if dc is not None:
+        dc = normalize_optional_text(dc)
+        if dc:
+            query["data_center"] = dc
+        else:
+            query["$or"] = [{"data_center": {"$in": [None, "", "None"]}}, {"data_center": {"$exists": False}}]
+    try:
+        return list(collection.find(query, {"_id": 0}))
+    except Exception as exc:
+        logger.warning("Mongo inventory record query failed: %s", exc)
+        return []
+
+
 validate_config()
 
 os.makedirs("sessions", exist_ok=True)
@@ -1266,6 +1296,34 @@ async def submit_utr_handler(event, order_id):
 
 # ================= BUYING FLOW =================
 def get_available_account_products():
+    if MONGODB_URI:
+        docs = get_mongo_available_inventory()
+        grouped = {}
+        for doc in docs:
+            key = (
+                doc.get("country_icon") or "🌍",
+                doc.get("country_name") or "Unknown",
+                normalize_optional_text(doc.get("category")),
+                doc.get("account_year"),
+                int(doc.get("price") or 0),
+                normalize_optional_text(doc.get("data_center"))
+            )
+            if key not in grouped:
+                grouped[key] = {
+                    "icon": key[0],
+                    "country": key[1],
+                    "category": key[2],
+                    "year": key[3],
+                    "price": int(key[4] or 0),
+                    "stock": 0,
+                    "phone": doc.get("phone"),
+                    "dc": None if not key[5] else key[5],
+                }
+            grouped[key]["stock"] += 1
+        products = list(grouped.values())
+        products.sort(key=lambda item: (str(item["country"]).lower(), -(item["year"] or 0), item["price"]))
+        return products
+
     columns = {row[1] for row in cur.execute("PRAGMA table_info(stock)").fetchall()}
     dc_expression = "data_center" if "data_center" in columns else "NULL"
     query = f"""
@@ -1293,6 +1351,35 @@ def get_available_account_products():
 
 
 def get_product_stock(product):
+    if MONGODB_URI:
+        category = normalize_optional_text(product.get("category"))
+        dc = product.get("dc")
+        if dc is not None and str(dc).strip().lower() in {"none", "null", ""}:
+            dc = None
+        count = 0
+        country = str(product.get("country") or "")
+        year = product.get("year")
+        price = int(product.get("price") or 0)
+        for doc in get_mongo_available_inventory():
+            if str(doc.get("country_name") or "").lower() != country.lower():
+                continue
+            if doc.get("account_year") is not None and year is not None and int(doc.get("account_year") or 0) != int(year):
+                continue
+            if int(doc.get("price") or 0) != price:
+                continue
+            doc_category = normalize_optional_text(doc.get("category"))
+            if category and doc_category != category:
+                continue
+            if not category and doc_category:
+                continue
+            doc_dc = normalize_optional_text(doc.get("data_center"))
+            if dc is not None and doc_dc != dc:
+                continue
+            if dc is None and doc_dc:
+                continue
+            count += 1
+        return count
+
     columns = {row[1] for row in cur.execute("PRAGMA table_info(stock)").fetchall()}
     category = normalize_optional_text(product.get("category"))
     dc = product.get("dc")
@@ -1465,7 +1552,17 @@ async def show_countries(event, flow, page=1):
     return await render_account_store(event, flow, page, send_banner=not isinstance(event, events.CallbackQuery.Event))
 
 async def show_years(event, flow, country):
-    rows = cur.execute("SELECT account_year, price, COUNT(*) FROM stock WHERE available=1 AND country_name LIKE ? GROUP BY account_year, price ORDER BY account_year DESC", (f"{country}%",)).fetchall()
+    if MONGODB_URI:
+        grouped = {}
+        for doc in get_mongo_available_inventory():
+            if not str(doc.get("country_name") or "").lower().startswith(str(country).lower()):
+                continue
+            key = (int(doc.get("account_year") or 0), int(doc.get("price") or 0))
+            grouped[key] = grouped.get(key, 0) + 1
+        rows = [(y, p, c) for (y, p), c in grouped.items()]
+        rows.sort(key=lambda row: (-row[0], row[1]))
+    else:
+        rows = cur.execute("SELECT account_year, price, COUNT(*) FROM stock WHERE available=1 AND country_name LIKE ? GROUP BY account_year, price ORDER BY account_year DESC", (f"{country}%",)).fetchall()
     if not rows: return await event.answer("❌ Out of stock for this country.", alert=True)
 
     uid = event.sender_id
@@ -1519,31 +1616,52 @@ async def process_purchase(event, country, year_str, price_str, category=None, d
     category = (category or "Standard").strip() or "Standard"
     dc = None if dc is None or str(dc).strip().lower() in {"none", "null", ""} else str(dc)
 
-    query = (
-        "SELECT phone, session_file, country_icon, account_year, twofa FROM stock "
-        "WHERE country_name LIKE ? AND account_year=? AND price=? AND available=1 AND category=?"
-    )
-    params = [f"{country}%", int(year_str), base_price, category]
-    if "data_center" in columns:
-        if dc is not None:
-            query += " AND data_center=?"
-            params.append(dc)
-        else:
-            query += " AND (data_center IS NULL OR data_center='' OR data_center='None')"
-
     async with get_user_lock(uid):
-        row = cur.execute(query, params).fetchone()
-        if not row:
-            return await event.answer("❌ Sold out! Another user just bought this account.", alert=True)
-        
-        phone, sess, c_icon, actual_year, twofa_pass = row
+        if MONGODB_URI:
+            records = get_mongo_inventory_records(country=country, year=year_str, price=base_price, category=category, dc=dc)
+            row = None
+            for doc in records:
+                if str(doc.get("country_name") or "").lower().startswith(str(country).lower()):
+                    row = doc
+                    break
+            if not row:
+                return await event.answer("❌ Sold out! Another user just bought this account.", alert=True)
+            phone = row.get("phone")
+            sess = row.get("session_file")
+            c_icon = row.get("country_icon") or "🌍"
+            actual_year = row.get("account_year")
+            twofa_pass = row.get("twofa") or "None"
+            cur.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (final_price, uid, final_price))
+            if cur.rowcount == 0:
+                return await event.answer(f"❌ Insufficient Balance! Need ₹{final_price}", alert=True)
+            set_stock_available_in_mongo(phone, False)
+            cur.execute("UPDATE stock SET available=0 WHERE phone=?", (phone,))
+            db.commit()
+        else:
+            query = (
+                "SELECT phone, session_file, country_icon, account_year, twofa FROM stock "
+                "WHERE country_name LIKE ? AND account_year=? AND price=? AND available=1 AND category=?"
+            )
+            params = [f"{country}%", int(year_str), base_price, category]
+            if "data_center" in columns:
+                if dc is not None:
+                    query += " AND data_center=?"
+                    params.append(dc)
+                else:
+                    query += " AND (data_center IS NULL OR data_center='' OR data_center='None')"
 
-        cur.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (final_price, uid, final_price))
-        if cur.rowcount == 0:
-            return await event.answer(f"❌ Insufficient Balance! Need ₹{final_price}", alert=True)
+            row = cur.execute(query, params).fetchone()
+            if not row:
+                return await event.answer("❌ Sold out! Another user just bought this account.", alert=True)
 
-        cur.execute("UPDATE stock SET available=0 WHERE phone=?", (phone,))
-        db.commit()
+            phone, sess, c_icon, actual_year, twofa_pass = row
+
+            cur.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (final_price, uid, final_price))
+            if cur.rowcount == 0:
+                return await event.answer(f"❌ Insufficient Balance! Need ₹{final_price}", alert=True)
+
+            cur.execute("UPDATE stock SET available=0 WHERE phone=?", (phone,))
+            db.commit()
 
     await event.edit(f"{PE_LIGHTNING} <b>Fetching Number (+{phone})...</b>")
     clean_sess = sess if not sess.endswith(".session") else sess[:-8]
@@ -1677,32 +1795,50 @@ async def process_bulk_sessions(event, uid, qty, state, final_cost):
         dc = None
     await event.respond(f"{PE_LIGHTNING} <b>Processing your sessions...</b>")
 
-    columns = {row[1] for row in cur.execute("PRAGMA table_info(stock)").fetchall()}
-    query = "SELECT phone, session_file, twofa, account_year FROM stock WHERE country_name LIKE ? AND account_year=? AND price=? AND category=? AND available=1"
-    params = [f"{country}%", year, price, category]
-    if "data_center" in columns:
-        if dc is not None:
-            query += " AND data_center=?"
-            params.append(str(dc))
-        else:
-            query += " AND (data_center IS NULL OR data_center='' OR data_center='None')"
-    query += " LIMIT ?"
-    params.append(qty)
-
     async with get_user_lock(uid):
-        rows = cur.execute(query, params).fetchall()
-        if len(rows) < qty:
-            return await event.respond(f"{P_NO} Stock changed during processing. Purchase Cancelled.")
-        
-        cur.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (final_cost, uid, final_cost))
-        if cur.rowcount == 0:
-            return await event.respond(f"{P_NO} Insufficient Balance! Purchase Cancelled.")
+        if MONGODB_URI:
+            rows = []
+            for doc in get_mongo_inventory_records(country=country, year=year, price=price, category=category, dc=dc):
+                rows.append((doc.get("phone"), doc.get("session_file"), doc.get("twofa") or "None", doc.get("account_year")))
+                if len(rows) >= qty:
+                    break
+            if len(rows) < qty:
+                return await event.respond(f"{P_NO} Stock changed during processing. Purchase Cancelled.")
+            cur.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (final_cost, uid, final_cost))
+            if cur.rowcount == 0:
+                return await event.respond(f"{P_NO} Insufficient Balance! Purchase Cancelled.")
+            phones = [r[0] for r in rows]
+            for phone, _, _, _ in rows:
+                set_stock_available_in_mongo(phone, False)
+                cur.execute("UPDATE stock SET available=0 WHERE phone=?", (phone,))
+            db.commit()
+            price_per_acc = final_cost // qty
+        else:
+            columns = {row[1] for row in cur.execute("PRAGMA table_info(stock)").fetchall()}
+            query = "SELECT phone, session_file, twofa, account_year FROM stock WHERE country_name LIKE ? AND account_year=? AND price=? AND category=? AND available=1"
+            params = [f"{country}%", year, price, category]
+            if "data_center" in columns:
+                if dc is not None:
+                    query += " AND data_center=?"
+                    params.append(str(dc))
+                else:
+                    query += " AND (data_center IS NULL OR data_center='' OR data_center='None')"
+            query += " LIMIT ?"
+            params.append(qty)
 
-        phones = [r[0] for r in rows]
-        placeholders = ",".join("?" for _ in phones)
-        cur.execute(f"UPDATE stock SET available=0 WHERE phone IN ({placeholders})", phones)
-        
-        price_per_acc = final_cost // qty
+            rows = cur.execute(query, params).fetchall()
+            if len(rows) < qty:
+                return await event.respond(f"{P_NO} Stock changed during processing. Purchase Cancelled.")
+
+            cur.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (final_cost, uid, final_cost))
+            if cur.rowcount == 0:
+                return await event.respond(f"{P_NO} Insufficient Balance! Purchase Cancelled.")
+
+            phones = [r[0] for r in rows]
+            placeholders = ",".join("?" for _ in phones)
+            cur.execute(f"UPDATE stock SET available=0 WHERE phone IN ({placeholders})", phones)
+
+            price_per_acc = final_cost // qty
         for p in phones:
             cur.execute("INSERT INTO orders (user_id, country, price, phone, otp) VALUES (?,?,?,?,?)", (uid, country, price_per_acc, p, "SESSION_FILES"))
         db.commit()
@@ -2771,8 +2907,22 @@ async def admin_actions(event):
                         perm_base = f"sessions/{acc['phone']}"
                         for ext in ['.session', '.session-wal', '.session-shm', '.session-journal']:
                             if os.path.exists(acc['path'] + ext): shutil.move(acc['path'] + ext, perm_base + ext)
+                        stock_doc = {
+                            "phone": acc['phone'],
+                            "session_file": perm_base + ".session",
+                            "country_name": c_name,
+                            "country_icon": c_icon,
+                            "account_year": year,
+                            "category": 'Good',
+                            "price": price,
+                            "available": 1,
+                            "twofa": twofa_pass,
+                            "added_date": datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+                        }
                         cur.execute("INSERT OR REPLACE INTO stock (phone, session_file, country_name, country_icon, account_year, category, price, available, twofa) VALUES (?,?,?,?,?,?,?,?,?)", 
                                     (acc['phone'], perm_base + ".session", c_name, c_icon, year, 'Good', price, 1, twofa_pass))
+                        if MONGODB_URI:
+                            upsert_stock_doc_to_mongo(stock_doc)
                         success += 1
                 db.commit()
                 os.remove(zip_path); shutil.rmtree(extracted_dir)
@@ -2852,6 +3002,22 @@ async def admin_actions(event):
                     f"INSERT OR REPLACE INTO stock ({', '.join(insert_columns)}) VALUES ({', '.join('?' for _ in insert_columns)})",
                     insert_values
                 )
+                if MONGODB_URI:
+                    mongo_doc = {
+                        "phone": phone,
+                        "session_file": sp + ".session",
+                        "country_name": c_name,
+                        "country_icon": c_icon,
+                        "account_year": year,
+                        "category": category,
+                        "price": price,
+                        "available": 1,
+                        "twofa": twofa_pass,
+                        "added_date": datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+                    }
+                    if dc is not None:
+                        mongo_doc["data_center"] = dc
+                    upsert_stock_doc_to_mongo(mongo_doc)
                 db.commit()
                 usd_price = to_usd(price)
                 display = f"{c_icon} {c_name}"
