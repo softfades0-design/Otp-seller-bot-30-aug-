@@ -585,6 +585,46 @@ def get_custom_countries():
     return cur.execute("SELECT code, name, flag FROM custom_countries").fetchall()
 
 
+def get_user_terms_accepted(uid):
+    collection = mongo_collection("users")
+    if collection is not None:
+        try:
+            row = collection.find_one({"user_id": int(uid)}, {"_id": 0, "terms_accepted": 1})
+            if row is not None:
+                return bool(row.get("terms_accepted", False))
+        except Exception as exc:
+            logger.warning("Mongo terms read failed for %s: %s: %s", uid, type(exc).__name__, exc)
+    row = cur.execute("SELECT terms_accepted FROM users WHERE user_id=?", (uid,)).fetchone()
+    return bool(row and row[0])
+
+
+def set_user_terms_accepted(uid, accepted=True):
+    collection = mongo_collection("users")
+    if collection is not None:
+        try:
+            collection.update_one(
+                {"user_id": int(uid)},
+                {"$set": {"user_id": int(uid), "terms_accepted": bool(accepted)}},
+                upsert=True
+            )
+        except Exception as exc:
+            logger.warning("Mongo terms write failed for %s: %s: %s", uid, type(exc).__name__, exc)
+    cur.execute("UPDATE users SET terms_accepted=? WHERE user_id=?", (1 if accepted else 0, uid))
+    db.commit()
+
+
+def migrate_sqlite_terms_to_mongo():
+    collection = mongo_collection("users")
+    if collection is None:
+        return
+    for uid, in cur.execute("SELECT user_id FROM users WHERE terms_accepted=1").fetchall():
+        collection.update_one(
+            {"user_id": int(uid)},
+            {"$setOnInsert": {"user_id": int(uid), "terms_accepted": True}},
+            upsert=True
+        )
+
+
 validate_config()
 
 os.makedirs("sessions", exist_ok=True)
@@ -740,6 +780,7 @@ try:
         settings_stats = migrate_sqlite_settings_to_mongo()
         logger.info("MongoDB settings migration complete: %s", settings_stats)
         migrate_sqlite_config_to_mongo()
+        migrate_sqlite_terms_to_mongo()
 except Exception as exc:
     logger.warning("MongoDB migration error: %s", exc)
 
@@ -3351,8 +3392,7 @@ async def handle_start(e):
                    "Thank you for supporting us ❤️")
             return await e.respond(msg, buttons=get_join_buttons())
 
-        row = cur.execute("SELECT terms_accepted FROM users WHERE user_id=?", (uid,)).fetchone()
-        terms_acc = row[0] if row else 0
+        terms_acc = get_user_terms_accepted(uid)
         if not terms_acc:
             msg = f"{PE_FLOWER} <b>TERMS & CONDITIONS</b>\nPlease read and accept our Terms & Conditions before using the bot."
             return await e.respond(msg, buttons=get_terms_buttons())
@@ -3613,8 +3653,7 @@ async def handle_callback_query(e):
 
         if data == "verify_join":
             if not await check_channel_joined(uid): return await e.answer("⚠️ You must join the channels first!", alert=True)
-            row = cur.execute("SELECT terms_accepted FROM users WHERE user_id=?", (uid,)).fetchone()
-            terms = row[0] if row else 0
+            terms = get_user_terms_accepted(uid)
             if not terms:
                 msg = f"{PE_FLOWER} <b>TERMS & CONDITIONS</b>\nPlease read and accept our Terms & Conditions before using the bot."
                 try: await e.edit(msg, buttons=get_terms_buttons())
@@ -3623,8 +3662,7 @@ async def handle_callback_query(e):
             await send_main_menu(e, uid)
 
         elif data == "tc_accept":
-            cur.execute("UPDATE users SET terms_accepted=1 WHERE user_id=?", (uid,))
-            db.commit()
+            set_user_terms_accepted(uid, True)
             await e.answer("✅ Terms Accepted!", alert=True)
             await send_main_menu(e, uid)
             
