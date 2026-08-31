@@ -16,9 +16,10 @@ from datetime import datetime
 from urllib.parse import quote
 
 try:
-    from pymongo import MongoClient
+    from pymongo import MongoClient, ReturnDocument
 except Exception:  # pragma: no cover
     MongoClient = None
+    ReturnDocument = None
 
 from telethon import TelegramClient, events, Button
 from telethon.errors import (
@@ -229,18 +230,47 @@ logger = logging.getLogger(__name__)
 MONGODB_URI = os.getenv("MONGODB_URI", "").strip()
 MONGODB_DB = os.getenv("MONGODB_DB", "otp_seller_bot")
 MONGODB_COLLECTION = os.getenv("MONGODB_COLLECTION", "inventory")
+mongo_client = None
+mongo_db = None
+mongo_ready = False
+
+
+def initialize_mongodb():
+    global mongo_client, mongo_db, mongo_ready
+    if not MONGODB_URI:
+        logger.info("MongoDB configured: NO")
+        logger.info("Persistent storage mode: SQLITE FALLBACK")
+        return False
+    if MongoClient is None:
+        logger.error("MongoDB configured: YES; connection: FAILED (pymongo is not installed)")
+        logger.info("Persistent storage mode: SQLITE FALLBACK")
+        return False
+    try:
+        mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000, connectTimeoutMS=5000)
+        mongo_client.admin.command("ping")
+        mongo_db = mongo_client[MONGODB_DB]
+        mongo_ready = True
+        logger.info("MongoDB configured: YES")
+        logger.info("MongoDB connection: SUCCESS")
+        logger.info("Database: %s", MONGODB_DB)
+        logger.info("Inventory collection: %s", MONGODB_COLLECTION)
+        logger.info("Persistent storage mode: MONGODB")
+        return True
+    except Exception as exc:
+        mongo_client = None
+        mongo_db = None
+        mongo_ready = False
+        logger.error("MongoDB configured: YES; connection: FAILED (%s: %s)", type(exc).__name__, exc)
+        logger.info("Persistent storage mode: SQLITE FALLBACK")
+        return False
+
+
+def mongo_collection(name):
+    return mongo_db[name] if mongo_ready and mongo_db is not None else None
 
 
 def mongo_inventory_collection():
-    if not MONGODB_URI or MongoClient is None:
-        return None
-    try:
-        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=3000)
-        client.admin.command("ping")
-        return client[MONGODB_DB][MONGODB_COLLECTION]
-    except Exception as exc:
-        logger.warning("MongoDB unavailable; falling back to SQLite stock state: %s", exc)
-        return None
+    return mongo_collection(MONGODB_COLLECTION)
 
 
 def stock_row_to_doc(row):
@@ -280,11 +310,43 @@ def set_stock_available_in_mongo(phone, available):
     if not collection or not phone:
         return False
     try:
-        collection.update_one({"phone": phone}, {"$set": {"available": 1 if available else 0}}, upsert=False)
-        return True
+        result = collection.update_one({"phone": phone}, {"$set": {"available": 1 if available else 0}}, upsert=False)
+        return result.matched_count == 1
     except Exception as exc:
-        logger.warning("Mongo inventory availability update failed for %s: %s", phone, exc)
+        logger.error("Mongo inventory availability update failed for %s: %s: %s", phone, type(exc).__name__, exc)
         return False
+
+
+def remove_stock_from_mongo(phone):
+    collection = mongo_inventory_collection()
+    if collection is None or not phone:
+        return False
+    try:
+        return collection.delete_one({"phone": phone}).deleted_count == 1
+    except Exception as exc:
+        logger.error("Mongo inventory removal failed for %s: %s: %s", phone, type(exc).__name__, exc)
+        return False
+
+
+def claim_stock_from_mongo(country, year, price, category=None, dc=None):
+    collection = mongo_inventory_collection()
+    if collection is None or ReturnDocument is None:
+        return None
+    query = {"available": 1, "country_name": {"$regex": f"^{re.escape(str(country))}", "$options": "i"}, "account_year": int(year), "price": int(price)}
+    category = normalize_optional_text(category)
+    query["category"] = {"$in": [None, "", "Good", "Standard"]} if category in {"", "Standard"} else category
+    if dc is not None:
+        query["data_center"] = normalize_optional_text(dc)
+    else:
+        query["$and"] = [{"$or": [{"data_center": {"$in": [None, "", "None"]}}, {"data_center": {"$exists": False}}]}]
+    try:
+        return collection.find_one_and_update(
+            query, {"$set": {"available": 0}}, projection={"_id": 0},
+            return_document=ReturnDocument.BEFORE
+        )
+    except Exception as exc:
+        logger.error("Mongo inventory claim failed: %s: %s", type(exc).__name__, exc)
+        return None
 
 
 def migrate_sqlite_stock_to_mongo():
@@ -324,6 +386,36 @@ def migrate_sqlite_stock_to_mongo():
     return {"status": "ok", **stats}
 
 
+def migrate_sqlite_settings_to_mongo():
+    collection = mongo_collection("settings")
+    if collection is None:
+        return {"status": "skipped_no_mongo", "migrated": 0, "skipped_duplicates": 0}
+    rows = cur.execute("SELECT key, value FROM settings").fetchall()
+    migrated = skipped = 0
+    for key, value in rows:
+        if collection.count_documents({"key": key}, limit=1):
+            skipped += 1
+            continue
+        collection.insert_one({"key": key, "value": value})
+        migrated += 1
+    return {"status": "ok", "migrated": migrated, "skipped_duplicates": skipped}
+
+
+def migrate_sqlite_config_to_mongo():
+    for row in cur.execute("SELECT country, year, price FROM auto_prices").fetchall():
+        mongo_collection("auto_prices").update_one(
+            {"country": row[0], "year": str(row[1])},
+            {"$setOnInsert": {"country": row[0], "year": str(row[1]), "price": row[2]}},
+            upsert=True
+        )
+    for row in cur.execute("SELECT code, name, flag FROM custom_countries").fetchall():
+        mongo_collection("custom_countries").update_one(
+            {"code": row[0]},
+            {"$setOnInsert": {"code": row[0], "name": row[1], "flag": row[2]}},
+            upsert=True
+        )
+
+
 def inventory_count_from_mongo(filters=None):
     collection = mongo_inventory_collection()
     if collection is None:
@@ -342,7 +434,18 @@ def get_mongo_available_inventory():
     try:
         return list(collection.find({"available": 1}, {"_id": 0}))
     except Exception as exc:
-        logger.warning("Mongo inventory read failed: %s", exc)
+        logger.error("Mongo inventory read failed: %s: %s", type(exc).__name__, exc)
+        return []
+
+
+def get_mongo_inventory_all():
+    collection = mongo_inventory_collection()
+    if collection is None:
+        return []
+    try:
+        return list(collection.find({}, {"_id": 0}))
+    except Exception as exc:
+        logger.error("Mongo inventory read failed: %s: %s", type(exc).__name__, exc)
         return []
 
 
@@ -357,23 +460,129 @@ def get_mongo_inventory_records(country=None, year=None, price=None, category=No
         query["account_year"] = int(year)
     if price is not None:
         query["price"] = int(price)
+    optional_filters = []
     if category is not None:
         category = normalize_optional_text(category)
         if category:
             query["category"] = category
         else:
-            query["$or"] = [{"category": {"$in": [None, "", "Good"]}}, {"category": {"$exists": False}}]
+            optional_filters.append({"category": {"$in": [None, "", "Good"]}})
+            optional_filters.append({"category": {"$exists": False}})
     if dc is not None:
         dc = normalize_optional_text(dc)
         if dc:
             query["data_center"] = dc
         else:
-            query["$or"] = [{"data_center": {"$in": [None, "", "None"]}}, {"data_center": {"$exists": False}}]
+            optional_filters.append({"data_center": {"$in": [None, "", "None"]}})
+            optional_filters.append({"data_center": {"$exists": False}})
+    if optional_filters:
+        query["$and"] = [{"$or": optional_filters[:2]}] if len(optional_filters) == 2 else [{"$or": optional_filters[:2]}, {"$or": optional_filters[2:]}]
     try:
         return list(collection.find(query, {"_id": 0}))
     except Exception as exc:
         logger.warning("Mongo inventory record query failed: %s", exc)
         return []
+
+
+def get_setting(key, default=None):
+    collection = mongo_collection("settings")
+    if collection is not None:
+        try:
+            row = collection.find_one({"key": key}, {"_id": 0, "value": 1})
+            return row.get("value", default) if row else default
+        except Exception as exc:
+            logger.error("Mongo setting read failed for %s: %s: %s", key, type(exc).__name__, exc)
+            return default
+    row = cur.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def set_setting(key, value):
+    collection = mongo_collection("settings")
+    if collection is not None:
+        try:
+            collection.update_one({"key": key}, {"$set": {"key": key, "value": value}}, upsert=True)
+        except Exception as exc:
+            logger.error("Mongo setting write failed for %s: %s: %s", key, type(exc).__name__, exc)
+            raise
+    cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+    db.commit()
+
+
+def delete_setting(key):
+    collection = mongo_collection("settings")
+    if collection is not None:
+        try:
+            collection.delete_one({"key": key})
+        except Exception as exc:
+            logger.error("Mongo setting delete failed for %s: %s: %s", key, type(exc).__name__, exc)
+            raise
+    cur.execute("DELETE FROM settings WHERE key=?", (key,))
+    db.commit()
+
+
+def get_auto_price(country, year):
+    collection = mongo_collection("auto_prices")
+    if collection is not None:
+        row = collection.find_one({"country": country, "year": str(year)}, {"_id": 0, "price": 1})
+        return row.get("price") if row else None
+    row = cur.execute("SELECT price FROM auto_prices WHERE country=? AND year=?", (country, str(year))).fetchone()
+    return row[0] if row else None
+
+
+def set_auto_price(country, year, price):
+    collection = mongo_collection("auto_prices")
+    if collection is not None:
+        if price == 0:
+            collection.delete_one({"country": country, "year": str(year)})
+        else:
+            collection.update_one({"country": country, "year": str(year)}, {"$set": {"country": country, "year": str(year), "price": price}}, upsert=True)
+    if price == 0:
+        cur.execute("DELETE FROM auto_prices WHERE country=? AND year=?", (country, str(year)))
+    else:
+        cur.execute("INSERT OR REPLACE INTO auto_prices (country, year, price) VALUES (?,?,?)", (country, str(year), price))
+    db.commit()
+
+
+def get_custom_payment(name):
+    collection = mongo_collection("custom_payments")
+    if collection is not None:
+        row = collection.find_one({"name": name}, {"_id": 0, "caption": 1, "qr_file_id": 1})
+        return (row.get("caption", ""), row.get("qr_file_id", "")) if row else None
+    return cur.execute("SELECT caption, qr_file_id FROM custom_payments WHERE name=?", (name,)).fetchone()
+
+
+def get_custom_payment_names():
+    collection = mongo_collection("custom_payments")
+    if collection is not None:
+        return [row.get("name") for row in collection.find({}, {"_id": 0, "name": 1}).sort("name", 1)]
+    return [row[0] for row in cur.execute("SELECT name FROM custom_payments").fetchall()]
+
+
+def add_custom_payment(name, caption, qr_file_id):
+    cur.execute("INSERT INTO custom_payments (name, caption, qr_file_id) VALUES (?,?,?)", (name, caption, qr_file_id))
+    payment_id = cur.lastrowid
+    collection = mongo_collection("custom_payments")
+    if collection is not None:
+        collection.update_one({"id": payment_id}, {"$set": {"id": payment_id, "name": name, "caption": caption, "qr_file_id": qr_file_id}}, upsert=True)
+    db.commit()
+
+
+def delete_custom_payment(payment_id):
+    row = cur.execute("SELECT qr_file_id FROM custom_payments WHERE id=?", (payment_id,)).fetchone()
+    cur.execute("DELETE FROM custom_payments WHERE id=?", (payment_id,))
+    collection = mongo_collection("custom_payments")
+    if collection is not None:
+        collection.delete_one({"id": payment_id})
+    db.commit()
+    return row
+
+
+def get_custom_countries():
+    collection = mongo_collection("custom_countries")
+    if collection is not None:
+        return [(row.get("code"), row.get("name"), row.get("flag")) for row in collection.find({}, {"_id": 0}).sort("name", 1)]
+    return cur.execute("SELECT code, name, flag FROM custom_countries").fetchall()
 
 
 validate_config()
@@ -518,21 +727,25 @@ def update_database_schema():
 setup_db()
 update_database_schema()
 
+initialize_mongodb()
+
 # Run the Mongo migration once the SQLite inventory is ready.
 try:
-    if MONGODB_URI:
+    if mongo_ready:
         mongo_stats = migrate_sqlite_stock_to_mongo()
         if mongo_stats.get("status") == "ok":
             logger.info("MongoDB inventory migration complete: %s", mongo_stats)
         elif mongo_stats.get("status") not in {"skipped_no_mongo", "db_not_ready"}:
             logger.warning("MongoDB migration did not complete: %s", mongo_stats)
+        settings_stats = migrate_sqlite_settings_to_mongo()
+        logger.info("MongoDB settings migration complete: %s", settings_stats)
+        migrate_sqlite_config_to_mongo()
 except Exception as exc:
     logger.warning("MongoDB migration error: %s", exc)
 
 # ================= HELPER FUNCTIONS =================
 def is_bot_online():
-    res = cur.execute("SELECT value FROM settings WHERE key='bot_status'").fetchone()
-    return res[0] == 'on' if res else True
+    return get_setting("bot_status", "on") == "on"
 
 def is_maintenance_mode():
     return get_setting("maintenance_enabled", "off") == "on"
@@ -560,8 +773,7 @@ def ensure_user(uid):
     db.commit()
 
 def get_usdt_rate():
-    res = cur.execute("SELECT value FROM settings WHERE key='usdt_rate'").fetchone()
-    try: return float(res[0]) if res else float(DEFAULT_USDT_RATE)
+    try: return float(get_setting("usdt_rate", DEFAULT_USDT_RATE))
     except: return float(DEFAULT_USDT_RATE)
 
 def get_auto_cancel_seconds():
@@ -575,21 +787,8 @@ def get_terms_url():
     return fix_url(get_setting("terms_url", TERMS_URL))
 
 def get_support_url():
-    res = cur.execute("SELECT value FROM settings WHERE key='support_url'").fetchone()
-    url = res[0] if res and res[0] else DEFAULT_SUPPORT_URL
+    url = get_setting("support_url", DEFAULT_SUPPORT_URL)
     return fix_url(url)
-
-def get_setting(key, default=None):
-    row = cur.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-    return row[0] if row else default
-
-def set_setting(key, value):
-    cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
-    db.commit()
-
-def delete_setting(key):
-    cur.execute("DELETE FROM settings WHERE key=?", (key,))
-    db.commit()
 
 async def send_broadcast_content(recipient_id, draft):
     message = draft["message"]
@@ -817,8 +1016,9 @@ def get_flag_by_country_name(name):
     for code, (c_name, c_flag) in COUNTRY_CODES.items():
         if c_name == name: return c_flag
     try:
-        row = cur.execute("SELECT flag FROM custom_countries WHERE name=?", (name,)).fetchone()
-        if row: return row[0]
+        for _, country_name, flag in get_custom_countries():
+            if country_name == name:
+                return flag
     except: pass
     return "🌍"
 
@@ -827,7 +1027,7 @@ def get_country_info(phone):
     if not phone: return "Unknown", "🌍"
     
     try:
-        customs = cur.execute("SELECT code, name, flag FROM custom_countries").fetchall()
+        customs = get_custom_countries()
         customs.sort(key=lambda x: len(x[0]), reverse=True)
         for code, name, flag in customs:
             if phone.startswith(code): return name, flag
@@ -999,9 +1199,8 @@ async def deposit_menu(event):
         Button.inline(f"👛 Cwallet (+5%)", "depm_Cwallet")
     ]
     
-    customs = cur.execute("SELECT name FROM custom_payments").fetchall()
-    for c in customs:
-        flat_buttons.append(Button.inline(f"💳 {c[0]}", f"depm_{c[0]}"))
+    for name in get_custom_payment_names():
+        flat_buttons.append(Button.inline(f"💳 {name}", f"depm_{name}"))
     
     btns = format_payment_buttons(flat_buttons)
     await bot.send_message(event.chat_id, msg, buttons=btns)
@@ -1296,7 +1495,7 @@ async def submit_utr_handler(event, order_id):
 
 # ================= BUYING FLOW =================
 def get_available_account_products():
-    if MONGODB_URI:
+    if mongo_ready:
         docs = get_mongo_available_inventory()
         grouped = {}
         for doc in docs:
@@ -1351,7 +1550,7 @@ def get_available_account_products():
 
 
 def get_product_stock(product):
-    if MONGODB_URI:
+    if mongo_ready:
         category = normalize_optional_text(product.get("category"))
         dc = product.get("dc")
         if dc is not None and str(dc).strip().lower() in {"none", "null", ""}:
@@ -1552,7 +1751,7 @@ async def show_countries(event, flow, page=1):
     return await render_account_store(event, flow, page, send_banner=not isinstance(event, events.CallbackQuery.Event))
 
 async def show_years(event, flow, country):
-    if MONGODB_URI:
+    if mongo_ready:
         grouped = {}
         for doc in get_mongo_available_inventory():
             if not str(doc.get("country_name") or "").lower().startswith(str(country).lower()):
@@ -1617,13 +1816,8 @@ async def process_purchase(event, country, year_str, price_str, category=None, d
     dc = None if dc is None or str(dc).strip().lower() in {"none", "null", ""} else str(dc)
 
     async with get_user_lock(uid):
-        if MONGODB_URI:
-            records = get_mongo_inventory_records(country=country, year=year_str, price=base_price, category=category, dc=dc)
-            row = None
-            for doc in records:
-                if str(doc.get("country_name") or "").lower().startswith(str(country).lower()):
-                    row = doc
-                    break
+        if mongo_ready:
+            row = claim_stock_from_mongo(country, year_str, base_price, category, dc)
             if not row:
                 return await event.answer("❌ Sold out! Another user just bought this account.", alert=True)
             phone = row.get("phone")
@@ -1633,8 +1827,8 @@ async def process_purchase(event, country, year_str, price_str, category=None, d
             twofa_pass = row.get("twofa") or "None"
             cur.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (final_price, uid, final_price))
             if cur.rowcount == 0:
+                set_stock_available_in_mongo(phone, True)
                 return await event.answer(f"❌ Insufficient Balance! Need ₹{final_price}", alert=True)
-            set_stock_available_in_mongo(phone, False)
             cur.execute("UPDATE stock SET available=0 WHERE phone=?", (phone,))
             db.commit()
         else:
@@ -1673,6 +1867,8 @@ async def process_purchase(event, country, year_str, price_str, category=None, d
     except Exception:
         async with get_user_lock(uid):
             cur.execute("DELETE FROM stock WHERE phone=?", (phone,))
+            if mongo_ready:
+                remove_stock_from_mongo(phone)
             cur.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (final_price, uid))
             db.commit()
         await client.disconnect()
@@ -1752,6 +1948,8 @@ async def auto_otp_task(phone):
         async with get_user_lock(uid):
             cur.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (order['price'], uid))
             cur.execute("UPDATE stock SET available=1 WHERE phone=?", (phone,))
+            if mongo_ready:
+                set_stock_available_in_mongo(phone, True)
             db.commit()
             
         try: await bot.edit_message(uid, msg_id, f"{P_TIME} <b>Order Expired!</b>\nThe 10-minute limit for <code>{phone}</code> ran out. Your money ({P_INR}{order['price']}) has been automatically refunded.")
@@ -1763,17 +1961,19 @@ async def init_session_purchase(event, country, year, price_str, category=None, 
     category = (category or "Standard").strip() or "Standard"
     dc = None if dc is None or str(dc).strip().lower() in {"none", "null", ""} else str(dc)
 
-    query = "SELECT COUNT(*) FROM stock WHERE country_name LIKE ? AND account_year=? AND price=? AND category=? AND available=1"
-    params = [f"{country}%", int(year), price, category]
-    if "data_center" in columns:
-        if dc is not None:
-            query += " AND data_center=?"
-            params.append(dc)
-        else:
-            query += " AND (data_center IS NULL OR data_center='' OR data_center='None')"
-
-    stock_row = cur.execute(query, params).fetchone()
-    stock = stock_row[0] if stock_row else 0
+    if mongo_ready:
+        stock = len(get_mongo_inventory_records(country=country, year=year, price=price, category=category, dc=dc))
+    else:
+        query = "SELECT COUNT(*) FROM stock WHERE country_name LIKE ? AND account_year=? AND price=? AND category=? AND available=1"
+        params = [f"{country}%", int(year), price, category]
+        if "data_center" in columns:
+            if dc is not None:
+                query += " AND data_center=?"
+                params.append(dc)
+            else:
+                query += " AND (data_center IS NULL OR data_center='' OR data_center='None')"
+        stock_row = cur.execute(query, params).fetchone()
+        stock = stock_row[0] if stock_row else 0
     if stock == 0: return await event.answer("❌ Out of stock!", alert=True)
     
     session_buy_state[uid] = {'country': country, 'year': year, 'price': price, 'stock': stock, 'category': category, 'dc': dc}
@@ -1796,20 +1996,24 @@ async def process_bulk_sessions(event, uid, qty, state, final_cost):
     await event.respond(f"{PE_LIGHTNING} <b>Processing your sessions...</b>")
 
     async with get_user_lock(uid):
-        if MONGODB_URI:
+        if mongo_ready:
             rows = []
-            for doc in get_mongo_inventory_records(country=country, year=year, price=price, category=category, dc=dc):
+            for _ in range(qty):
+                doc = claim_stock_from_mongo(country, year, price, category, dc)
+                if not doc:
+                    for claimed_phone, _, _, _ in rows:
+                        set_stock_available_in_mongo(claimed_phone, True)
+                    return await event.respond(f"{P_NO} Stock changed during processing. Purchase Cancelled.")
                 rows.append((doc.get("phone"), doc.get("session_file"), doc.get("twofa") or "None", doc.get("account_year")))
-                if len(rows) >= qty:
-                    break
             if len(rows) < qty:
                 return await event.respond(f"{P_NO} Stock changed during processing. Purchase Cancelled.")
             cur.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (final_cost, uid, final_cost))
             if cur.rowcount == 0:
+                for claimed_phone, _, _, _ in rows:
+                    set_stock_available_in_mongo(claimed_phone, True)
                 return await event.respond(f"{P_NO} Insufficient Balance! Purchase Cancelled.")
             phones = [r[0] for r in rows]
             for phone, _, _, _ in rows:
-                set_stock_available_in_mongo(phone, False)
                 cur.execute("UPDATE stock SET available=0 WHERE phone=?", (phone,))
             db.commit()
             price_per_acc = final_cost // qty
@@ -1952,7 +2156,7 @@ async def admin_panel_handler(event):
     
     status_text = "🟢 Bot is ON" if is_bot_online() else "🔴 Bot is OFF"
     total_users = cur.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    total_stock = cur.execute("SELECT COUNT(*) FROM stock WHERE available=1").fetchone()[0]
+    total_stock = inventory_count_from_mongo({"available": 1}) if mongo_ready else cur.execute("SELECT COUNT(*) FROM stock WHERE available=1").fetchone()[0]
     pending_deposits = cur.execute("SELECT COUNT(*) FROM deposits WHERE status='pending'").fetchone()[0]
     btns = []
     
@@ -2076,8 +2280,12 @@ async def render_admin_stats(event, period="all"):
         "WHERE referred_by IS NOT NULL GROUP BY referred_by ORDER BY referrals DESC LIMIT 3"
     ).fetchall()
 
-    available_stock = cur.execute("SELECT COUNT(*) FROM stock WHERE available=1").fetchone()[0]
-    used_stock = cur.execute("SELECT COUNT(*) FROM stock WHERE available=0").fetchone()[0]
+    if mongo_ready:
+        available_stock = inventory_count_from_mongo({"available": 1})
+        used_stock = inventory_count_from_mongo({"available": 0})
+    else:
+        available_stock = cur.execute("SELECT COUNT(*) FROM stock WHERE available=1").fetchone()[0]
+        used_stock = cur.execute("SELECT COUNT(*) FROM stock WHERE available=0").fetchone()[0]
     pending_deposits = cur.execute("SELECT COUNT(*) FROM deposits WHERE status='pending'").fetchone()[0]
     top_text = "Unavailable"
     if top_referrers:
@@ -2274,7 +2482,11 @@ async def edit_admin_menu(event, target_id):
 async def send_manage_stock_page(event, page):
     limit = 10
     offset = (page - 1) * limit
-    rows = cur.execute("SELECT DISTINCT country_name FROM stock ORDER BY country_name").fetchall()
+    if mongo_ready:
+        rows = sorted({doc.get("country_name") for doc in get_mongo_inventory_all() if doc.get("country_name")})
+        rows = [(country,) for country in rows]
+    else:
+        rows = cur.execute("SELECT DISTINCT country_name FROM stock ORDER BY country_name").fetchall()
     total = len(rows)
     countries = rows[offset:offset+limit]
     
@@ -2291,7 +2503,11 @@ async def send_manage_stock_page(event, page):
     await event.edit(f"{PE_LOCATION} <b>Manage Stock</b> (Page {page})\nSelect a country to edit its properties:", buttons=btns)
 
 async def send_manage_stock_country(event, c_name):
-    years = cur.execute("SELECT DISTINCT account_year FROM stock WHERE country_name=? ORDER BY account_year DESC", (c_name,)).fetchall()
+    if mongo_ready:
+        years = sorted({doc.get("account_year") for doc in get_mongo_inventory_all() if doc.get("country_name") == c_name}, reverse=True)
+        years = [(year,) for year in years]
+    else:
+        years = cur.execute("SELECT DISTINCT account_year FROM stock WHERE country_name=? ORDER BY account_year DESC", (c_name,)).fetchall()
     flag = get_flag_by_country_name(c_name)
     btns = [
         [Button.inline("Edit Country Name", f"adm_msedit|name|{c_name}"), Button.inline("Edit Flag", f"adm_msedit|flag|{c_name}")],
@@ -2308,11 +2524,14 @@ async def send_autoprice_page(event, page):
     limit = 10
     offset = (page - 1) * limit
     c_list = set([c[0] for c in COUNTRY_CODES.values()])
-    db_countries = cur.execute("SELECT DISTINCT country_name FROM stock").fetchall()
+    if mongo_ready:
+        db_countries = {(doc.get("country_name"),) for doc in get_mongo_inventory_all() if doc.get("country_name")}
+    else:
+        db_countries = cur.execute("SELECT DISTINCT country_name FROM stock").fetchall()
     for (c,) in db_countries: c_list.add(c)
     
-    custom_countries = cur.execute("SELECT DISTINCT name FROM custom_countries").fetchall()
-    for (c,) in custom_countries: c_list.add(c)
+    for _, country_name, _ in get_custom_countries():
+        c_list.add(country_name)
 
     c_list = sorted(list(c_list))
     total = len(c_list)
@@ -2675,8 +2894,7 @@ async def admin_actions(event):
 
     if action_data == "togglebot" and (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
         new_status = 'off' if is_bot_online() else 'on'
-        cur.execute("UPDATE settings SET value=? WHERE key='bot_status'", (new_status,))
-        db.commit()
+        set_setting("bot_status", new_status)
         await event.answer(f"Bot turned {new_status.upper()}", alert=True)
         class FakeEvent: chat_id = chat; sender_id = uid
         await admin_panel_handler(FakeEvent())
@@ -2748,6 +2966,8 @@ async def admin_actions(event):
                 name = html.escape((await get_reply(f"{P_GLOBE} <b>Enter Country Name:</b>\n<i>Example: India</i>")).text.strip())
                 
                 cur.execute("INSERT OR REPLACE INTO custom_countries (code, name, flag) VALUES (?,?,?)", (code, name, flag))
+                if mongo_ready:
+                    mongo_collection("custom_countries").update_one({"code": code}, {"$set": {"code": code, "name": name, "flag": flag}}, upsert=True)
                 db.commit()
                 await conv.send_message(f"{P_YES} <b>Custom Country Added Successfully!</b>\n{flag} {name} (+{code})\n\n<i>It will now automatically be recognized when adding stock!</i>")
 
@@ -2775,19 +2995,27 @@ async def admin_actions(event):
                 if action == "name":
                     new_name = html.escape((await get_reply(f"{P_DOC} <b>Enter NEW Name for {c_name}:</b>")).text)
                     cur.execute("UPDATE stock SET country_name=? WHERE country_name=?", (new_name, c_name))
+                    if mongo_ready:
+                        mongo_inventory_collection().update_many({"country_name": c_name}, {"$set": {"country_name": new_name}})
                     cur.execute("UPDATE auto_prices SET country=? WHERE country=?", (new_name, c_name))
+                    if mongo_ready:
+                        mongo_collection("auto_prices").update_many({"country": c_name}, {"$set": {"country": new_name}})
                     db.commit()
                     await conv.send_message(f"{P_YES} Country '{c_name}' successfully renamed to '{new_name}'!")
                     
                 elif action == "flag":
                     new_flag = html.escape((await get_reply(f"{P_FLAG} <b>Enter NEW Flag Emoji for {c_name}:</b>")).text)
                     cur.execute("UPDATE stock SET country_icon=? WHERE country_name=?", (new_flag, c_name))
+                    if mongo_ready:
+                        mongo_inventory_collection().update_many({"country_name": c_name}, {"$set": {"country_icon": new_flag}})
                     db.commit()
                     await conv.send_message(f"{P_YES} Flag updated to {new_flag} for '{c_name}'!")
                     
                 elif action == "cprice":
                     new_p = int((await get_reply(f"{P_MONEY} <b>Enter NEW Common Price for all {c_name} accounts:</b>")).text)
                     cur.execute("UPDATE stock SET price=? WHERE country_name=?", (new_p, c_name))
+                    if mongo_ready:
+                        mongo_inventory_collection().update_many({"country_name": c_name}, {"$set": {"price": new_p}})
                     db.commit()
                     await conv.send_message(f"{P_YES} All existing '{c_name}' accounts updated to {P_INR}{new_p}!")
                     
@@ -2795,6 +3023,8 @@ async def admin_actions(event):
                     year = parts[3]
                     new_p = int((await get_reply(f"{P_MONEY} <b>Enter NEW Price for {c_name} ({year}):</b>")).text)
                     cur.execute("UPDATE stock SET price=? WHERE country_name=? AND account_year=?", (new_p, c_name, year))
+                    if mongo_ready:
+                        mongo_inventory_collection().update_many({"country_name": c_name, "account_year": int(year)}, {"$set": {"price": new_p}})
                     db.commit()
                     await conv.send_message(f"{P_YES} All existing '{c_name}' ({year}) accounts updated to {P_INR}{new_p}!")
                     
@@ -2803,12 +3033,11 @@ async def admin_actions(event):
                 c_name, year = parts[1], parts[2]
                 new_p = int((await get_reply(f"{P_ASST} <b>Enter Auto-Price for {c_name} ({year}):</b>\n<i>(Enter 0 to remove this auto-price)</i>")).text)
                 if new_p == 0:
-                    cur.execute("DELETE FROM auto_prices WHERE country=? AND year=?", (c_name, year))
+                    set_auto_price(c_name, year, 0)
                     await conv.send_message(f"{P_YES} Auto-Price for {c_name} ({year}) removed!")
                 else:
-                    cur.execute("INSERT OR REPLACE INTO auto_prices (country, year, price) VALUES (?,?,?)", (c_name, year, new_p))
+                    set_auto_price(c_name, year, new_p)
                     await conv.send_message(f"{P_YES} Auto-Price for {c_name} ({year}) set to {P_INR}{new_p}! Incoming accounts will use this price automatically.")
-                db.commit()
 
             elif action_data == "addpay" and (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
                 name = html.escape((await get_reply(f"{P_CARD} <b>Enter Payment Method Name:</b>\n<i>(e.g., Binance Pay, TRX)</i>")).text)
@@ -2820,22 +3049,22 @@ async def admin_actions(event):
                 
                 cap_msg = (await get_reply(f"{P_DOC} <b>Enter Payment Caption:</b>\n<i>(Use <code>text</code> to make wallet IDs or UPI copyable)</i>")).text
                 cap_msg = html.escape(cap_msg).replace("&lt;code&gt;", "<code>").replace("&lt;/code&gt;", "</code>")
-                cur.execute("INSERT INTO custom_payments (name, caption, qr_file_id) VALUES (?,?,?)", (name, cap_msg, qr_path))
-                db.commit()
+                add_custom_payment(name, cap_msg, qr_path)
                 await conv.send_message(f"{P_YES} Payment Method '{name}' added successfully!")
 
             elif action_data == "delpay" and (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
-                rows = cur.execute("SELECT id, name FROM custom_payments").fetchall()
+                if mongo_ready:
+                    rows = [(row.get("id"), row.get("name")) for row in mongo_collection("custom_payments").find({}, {"_id": 0, "id": 1, "name": 1}).sort("id", 1)]
+                else:
+                    rows = cur.execute("SELECT id, name FROM custom_payments").fetchall()
                 if not rows: return await conv.send_message(f"{P_NO} No custom payment methods.")
                 msg = f"{P_DOC} <b>Reply with the ID of the method to delete:</b>\n\n"
                 for r in rows: msg += f"ID: {r[0]} - {r[1]}\n"
                 del_id = (await get_reply(msg)).text
                 try:
                     del_id = int(del_id)
-                    file_path = cur.execute("SELECT qr_file_id FROM custom_payments WHERE id=?", (del_id,)).fetchone()
+                    file_path = delete_custom_payment(del_id)
                     if file_path and file_path[0] and os.path.exists(file_path[0]): os.remove(file_path[0])
-                    cur.execute("DELETE FROM custom_payments WHERE id=?", (del_id,))
-                    db.commit()
                     await conv.send_message(f"{P_YES} Deleted!")
                 except: await conv.send_message(f"{P_NO} Invalid ID.")
 
@@ -2889,11 +3118,11 @@ async def admin_actions(event):
                     twofa_pass = "None"
                     if has_2fa: twofa_pass = html.escape((await get_reply(f"{P_2FA} <b>Enter 2FA Password for {len(accs)}x {c_name} accounts:</b>")).text)
 
-                    auto_row = cur.execute("SELECT price FROM auto_prices WHERE country=? AND year=?", (c_name, str(year))).fetchone()
-                    if not auto_row: auto_row = cur.execute("SELECT price FROM auto_prices WHERE country=? AND year='Common'", (c_name,)).fetchone()
+                    auto_price = get_auto_price(c_name, year)
+                    if auto_price is None: auto_price = get_auto_price(c_name, "Common")
 
-                    if auto_row:
-                        price = auto_row[0]
+                    if auto_price is not None:
+                        price = auto_price
                         await conv.send_message(f"⚡ <b>Auto-Price Applied:</b> {len(accs)}x {c_name} ({year}) at {P_INR}{price}.")
                     else:
                         existing_price = cur.execute("SELECT price FROM stock WHERE country_name=? LIMIT 1", (c_name,)).fetchone()
@@ -2921,7 +3150,7 @@ async def admin_actions(event):
                         }
                         cur.execute("INSERT OR REPLACE INTO stock (phone, session_file, country_name, country_icon, account_year, category, price, available, twofa) VALUES (?,?,?,?,?,?,?,?,?)", 
                                     (acc['phone'], perm_base + ".session", c_name, c_icon, year, 'Good', price, 1, twofa_pass))
-                        if MONGODB_URI:
+                        if mongo_ready:
                             upsert_stock_doc_to_mongo(stock_doc)
                         success += 1
                 db.commit()
@@ -3002,7 +3231,7 @@ async def admin_actions(event):
                     f"INSERT OR REPLACE INTO stock ({', '.join(insert_columns)}) VALUES ({', '.join('?' for _ in insert_columns)})",
                     insert_values
                 )
-                if MONGODB_URI:
+                if mongo_ready:
                     mongo_doc = {
                         "phone": phone,
                         "session_file": sp + ".session",
@@ -3033,8 +3262,7 @@ async def admin_actions(event):
             elif action_data == "supporturl" and (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
                 url = (await get_reply("🔗 Enter new Support URL (must start with http:// or https://):")).text
                 if not url.startswith("http"): url = "https://" + url.replace("@", "t.me/")
-                cur.execute("UPDATE settings SET value=? WHERE key='support_url'", (url,))
-                db.commit()
+                set_setting("support_url", url)
                 await conv.send_message(f"{P_YES} Support URL updated.")
 
             elif action_data == "bcast" and (uid in ADMIN_IDS or has_perm(uid, 'p_stats')):
@@ -3062,14 +3290,12 @@ async def admin_actions(event):
                 
             elif action_data == "refpct" and (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
                 pct = int((await get_reply(f"{P_USERS} <b>New Referral %:</b>")).text)
-                cur.execute("UPDATE settings SET value=? WHERE key='ref_percent'", (str(pct),))
-                db.commit()
+                set_setting("ref_percent", str(pct))
                 await conv.send_message(f"{P_YES} Ref revenue set to {pct}%.")
 
             elif action_data == "usdtrate" and (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
                 r = float((await get_reply(f"{P_USDT} <b>New USDT Rate (INR):</b>")).text)
-                cur.execute("UPDATE settings SET value=? WHERE key='usdt_rate'", (str(r),))
-                db.commit()
+                set_setting("usdt_rate", str(r))
                 await conv.send_message(f"{P_YES} Rate set to {r}.")
 
             elif action_data == "restoreusr" and (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
@@ -3340,7 +3566,7 @@ async def handle_all_messages(e):
                     if method == "UPI":
                         return await show_upi_qr(event, amt)
                     else:
-                        row = cur.execute("SELECT caption, qr_file_id FROM custom_payments WHERE name=?", (method,)).fetchone()
+                        row = get_custom_payment(method)
                         if row:
                             cap = row[0] + f"{rate_text}\n\n👇 <b>After paying, send a clear Screenshot here:</b>"
                             btns = [[Button.inline("❌ Cancel", "cancel_action")]]
