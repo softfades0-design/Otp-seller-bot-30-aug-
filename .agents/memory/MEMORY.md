@@ -1,0 +1,1 @@
+- [Telegram runtime validation](telegram-runtime-validation.md) — live worker checks require the existing Telegram credentials; do not weaken the fail-fast guard.

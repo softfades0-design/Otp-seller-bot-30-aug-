@@ -12,7 +12,7 @@ import shutil
 import html
 import json
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import quote
 
 try:
@@ -22,6 +22,7 @@ except Exception:  # pragma: no cover
     ReturnDocument = None
 
 from telethon import TelegramClient, events, Button
+from telethon.sessions import StringSession, SQLiteSession
 from telethon.errors import (
     SessionPasswordNeededError, 
     MessageNotModifiedError,
@@ -230,6 +231,7 @@ logger = logging.getLogger(__name__)
 MONGODB_URI = os.getenv("MONGODB_URI", "").strip()
 MONGODB_DB = os.getenv("MONGODB_DB", "otp_seller_bot")
 MONGODB_COLLECTION = os.getenv("MONGODB_COLLECTION", "inventory")
+MONGODB_SESSIONS_COLLECTION = os.getenv("MONGODB_SESSIONS_COLLECTION", "telegram_sessions")
 mongo_client = None
 mongo_db = None
 mongo_ready = False
@@ -590,10 +592,10 @@ def get_user_terms_accepted(uid):
     if collection is not None:
         try:
             row = collection.find_one({"user_id": int(uid)}, {"_id": 0, "terms_accepted": 1})
-            if row is not None:
-                return bool(row.get("terms_accepted", False))
+            return bool(row and row.get("terms_accepted", False))
         except Exception as exc:
             logger.warning("Mongo terms read failed for %s: %s: %s", uid, type(exc).__name__, exc)
+            return False
     row = cur.execute("SELECT terms_accepted FROM users WHERE user_id=?", (uid,)).fetchone()
     return bool(row and row[0])
 
@@ -607,8 +609,10 @@ def set_user_terms_accepted(uid, accepted=True):
                 {"$set": {"user_id": int(uid), "terms_accepted": bool(accepted)}},
                 upsert=True
             )
+            return
         except Exception as exc:
-            logger.warning("Mongo terms write failed for %s: %s: %s", uid, type(exc).__name__, exc)
+            logger.error("Mongo terms write failed for %s: %s: %s", uid, type(exc).__name__, exc)
+            raise
     cur.execute("UPDATE users SET terms_accepted=? WHERE user_id=?", (1 if accepted else 0, uid))
     db.commit()
 
@@ -625,14 +629,467 @@ def migrate_sqlite_terms_to_mongo():
         )
 
 
+# ================= MONGODB PRIMARY PERSISTENCE =================
+# These helpers deliberately use Mongo when it is connected and only touch
+# SQLite in the explicit no-Mongo compatibility path.  Existing Mongo fields
+# are never replaced by an empty/default SQLite value during migration.
+USER_DEFAULTS = {
+    "balance": 0,
+    "referred_by": None,
+    "total_deposited": 0,
+    "joined_date": None,
+    "banned": 0,
+    "discount": 0,
+    "terms_accepted": False,
+}
+ADMIN_PERMISSIONS = ("p_add_stock", "p_manage_stock", "p_stats", "p_bal", "p_settings")
+
+
+def _mongo_update_missing(collection, key, values):
+    """Insert a document or fill only fields absent from an existing document."""
+    if collection is None:
+        return None
+    collection.update_one({key[0]: key[1]}, {"$setOnInsert": values}, upsert=True)
+    existing = collection.find_one({key[0]: key[1]}, {"_id": 0})
+    if existing is None:
+        return None
+    missing = {field: value for field, value in values.items() if field not in existing}
+    if missing:
+        collection.update_one({key[0]: key[1]}, {"$set": missing})
+        existing.update(missing)
+    return existing
+
+
+def _mongo_next_id(collection_name):
+    counters = mongo_collection("counters")
+    if counters is None:
+        return None
+    row = counters.find_one_and_update(
+        {"_id": collection_name},
+        {"$inc": {"value": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return int(row["value"])
+
+
+def get_user_doc(uid):
+    uid = int(uid)
+    collection = mongo_collection("users")
+    if collection is not None:
+        try:
+            return collection.find_one({"user_id": uid}, {"_id": 0})
+        except Exception as exc:
+            logger.error("Mongo user read failed for %s: %s", uid, type(exc).__name__)
+            return None
+    return None
+
+
+def ensure_user_mongo(uid):
+    uid = int(uid)
+    collection = mongo_collection("users")
+    if collection is None:
+        return None
+    defaults = dict(USER_DEFAULTS)
+    defaults.update({"user_id": uid, "joined_date": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")})
+    try:
+        return _mongo_update_missing(collection, ("user_id", uid), defaults)
+    except Exception as exc:
+        logger.error("Mongo user ensure failed for %s: %s", uid, type(exc).__name__)
+        raise
+
+
+def update_user_fields(uid, fields):
+    collection = mongo_collection("users")
+    if collection is None:
+        return False
+    payload = {key: value for key, value in fields.items() if key != "_id"}
+    if not payload:
+        return True
+    try:
+        return collection.update_one({"user_id": int(uid)}, {"$set": payload}, upsert=True).acknowledged
+    except Exception as exc:
+        logger.error("Mongo user write failed for %s: %s", uid, type(exc).__name__)
+        raise
+
+
+def get_user_value(uid, field, default=None):
+    doc = get_user_doc(uid)
+    return doc.get(field, default) if doc is not None else default
+
+
+def count_users(query=None):
+    collection = mongo_collection("users")
+    if collection is None:
+        return 0
+    try:
+        return collection.count_documents(query or {})
+    except Exception as exc:
+        logger.error("Mongo user count failed: %s: %s", type(exc).__name__)
+        return 0
+
+
+def update_user_balance(uid, amount, require_balance=None):
+    """Atomically change a balance. Returns the old user document or None."""
+    collection = mongo_collection("users")
+    if collection is None:
+        return None
+    query = {"user_id": int(uid)}
+    if require_balance is not None:
+        query["balance"] = {"$gte": int(require_balance)}
+    try:
+        return collection.find_one_and_update(
+            query,
+            {"$inc": {"balance": int(amount)}},
+            return_document=ReturnDocument.BEFORE,
+            projection={"_id": 0},
+        )
+    except Exception as exc:
+        logger.error("Mongo balance update failed for %s: %s", uid, type(exc).__name__)
+        raise
+
+
+def increment_user_field(uid, field, amount):
+    collection = mongo_collection("users")
+    if collection is None:
+        return None
+    return collection.find_one_and_update(
+        {"user_id": int(uid)},
+        {"$inc": {field: int(amount)}},
+        return_document=ReturnDocument.AFTER,
+        projection={"_id": 0},
+    )
+
+
+def get_admin_doc(uid):
+    collection = mongo_collection("admins")
+    if collection is None:
+        return None
+    try:
+        return collection.find_one({"user_id": int(uid)}, {"_id": 0})
+    except Exception as exc:
+        logger.error("Mongo admin read failed: %s", type(exc).__name__)
+        return None
+
+
+def set_admin_permission(uid, permission, value):
+    if permission not in ADMIN_PERMISSIONS:
+        raise ValueError("Invalid admin permission")
+    collection = mongo_collection("admins")
+    if collection is None:
+        return False
+    collection.update_one(
+        {"user_id": int(uid)},
+        {"$set": {"user_id": int(uid), permission: int(bool(value))}},
+        upsert=True,
+    )
+    return True
+
+
+def list_admin_docs():
+    collection = mongo_collection("admins")
+    if collection is None:
+        return []
+    return list(collection.find({}, {"_id": 0}).sort("user_id", 1))
+
+
+def delete_admin(uid):
+    collection = mongo_collection("admins")
+    if collection is None:
+        return False
+    return collection.delete_one({"user_id": int(uid)}).deleted_count == 1
+
+
+def migrate_sqlite_primary_domains_to_mongo():
+    """Idempotently migrate all remaining SQLite-backed durable records."""
+    stats = {"users": 0, "admins": 0, "deposits": 0, "upi_orders": 0, "orders": 0}
+    users = mongo_collection("users")
+    if users is not None:
+        columns = [row[1] for row in cur.execute("PRAGMA table_info(users)").fetchall()]
+        for row in cur.execute(f"SELECT {', '.join(columns)} FROM users").fetchall():
+            values = dict(zip(columns, row))
+            values["user_id"] = int(values["user_id"])
+            values["terms_accepted"] = bool(values.get("terms_accepted", 0))
+            _mongo_update_missing(users, ("user_id", values["user_id"]), values)
+            stats["users"] += 1
+
+    admins = mongo_collection("admins")
+    if admins is not None:
+        columns = [row[1] for row in cur.execute("PRAGMA table_info(admins)").fetchall()]
+        for row in cur.execute(f"SELECT {', '.join(columns)} FROM admins").fetchall():
+            values = dict(zip(columns, row))
+            values["user_id"] = int(values["user_id"])
+            _mongo_update_missing(admins, ("user_id", values["user_id"]), values)
+            stats["admins"] += 1
+
+    for table in ("deposits", "upi_orders", "orders"):
+        collection = mongo_collection(table)
+        if collection is None:
+            continue
+        columns = [row[1] for row in cur.execute(f"PRAGMA table_info({table})").fetchall()]
+        id_column = "order_id" if table == "upi_orders" else "id"
+        for row in cur.execute(f"SELECT {', '.join(columns)} FROM {table}").fetchall():
+            values = dict(zip(columns, row))
+            if table == "upi_orders":
+                if not values.get("order_id"):
+                    continue
+                key = ("order_id", values["order_id"])
+            else:
+                if values.get("id") is None:
+                    continue
+                values["id"] = int(values["id"])
+                key = ("id", values["id"])
+            values["user_id"] = int(values["user_id"]) if values.get("user_id") is not None else None
+            if table == "deposits" and values.get("screenshot") and os.path.exists(values["screenshot"]):
+                try:
+                    with open(values["screenshot"], "rb") as image_file:
+                        values["screenshot_data"] = image_file.read()
+                except OSError:
+                    pass
+            _mongo_update_missing(collection, key, values)
+            stats[table] += 1
+        if table != "upi_orders":
+            newest = collection.find_one(sort=[("id", -1)], projection={"id": 1})
+            if newest and newest.get("id") is not None:
+                mongo_collection("counters").update_one(
+                    {"_id": table},
+                    {"$max": {"value": int(newest["id"])}},
+                    upsert=True,
+                )
+    return stats
+
+
+def get_mongo_deposit(dep_id):
+    collection = mongo_collection("deposits")
+    if collection is None:
+        return None
+    return collection.find_one({"id": int(dep_id)}, {"_id": 0})
+
+
+def create_deposit(user_id, amount, method_name, status="pending", screenshot=None, utr=None):
+    collection = mongo_collection("deposits")
+    if collection is None:
+        return None
+    dep_id = _mongo_next_id("deposits")
+    doc = {
+        "id": dep_id, "user_id": int(user_id), "amount": int(amount),
+        "method_name": method_name, "status": status,
+        "date": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "screenshot": screenshot, "utr": utr,
+    }
+    if screenshot and os.path.exists(screenshot):
+        try:
+            with open(screenshot, "rb") as image_file:
+                doc["screenshot_data"] = image_file.read()
+        except OSError:
+            pass
+    collection.insert_one(doc)
+    return dep_id
+
+
+def update_deposit(dep_id, fields, expected_status=None):
+    collection = mongo_collection("deposits")
+    if collection is None:
+        return None
+    query = {"id": int(dep_id)}
+    if expected_status is not None:
+        query["status"] = expected_status
+    return collection.find_one_and_update(
+        query, {"$set": fields}, return_document=ReturnDocument.BEFORE,
+        projection={"_id": 0},
+    )
+
+
+def create_upi_order(order_id, user_id, amount):
+    collection = mongo_collection("upi_orders")
+    if collection is None:
+        return False
+    collection.update_one(
+        {"order_id": order_id},
+        {"$setOnInsert": {
+            "order_id": order_id, "user_id": int(user_id), "amount": int(amount),
+            "status": "pending", "date": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        }},
+        upsert=True,
+    )
+    return True
+
+
+def add_order(user_id, country, year, price, phone, otp):
+    collection = mongo_collection("orders")
+    if collection is None:
+        return None
+    order_id = _mongo_next_id("orders")
+    collection.insert_one({
+        "id": order_id, "user_id": int(user_id), "country": country,
+        "year": int(year) if year is not None else None, "price": int(price),
+        "phone": phone, "otp": otp,
+        "date": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    return order_id
+
+
+def mongo_order_summary(user_id=None):
+    collection = mongo_collection("orders")
+    if collection is None:
+        return 0, 0
+    query = {"user_id": int(user_id)} if user_id is not None else {}
+    rows = list(collection.find(query, {"_id": 0, "price": 1}))
+    return len(rows), sum(int(row.get("price") or 0) for row in rows)
+
+
+def mongo_deposit_summary(user_id=None, status=None):
+    collection = mongo_collection("deposits")
+    if collection is None:
+        return 0, 0
+    query = {}
+    if user_id is not None:
+        query["user_id"] = int(user_id)
+    if status is not None:
+        query["status"] = status
+    rows = list(collection.find(query, {"_id": 0, "amount": 1}))
+    return len(rows), sum(int(row.get("amount") or 0) for row in rows)
+
+
+def record_refund(user_id, amount, phone=None, reason="purchase_refund"):
+    collection = mongo_collection("refunds")
+    if collection is None:
+        return False
+    refund_id = _mongo_next_id("refunds")
+    collection.insert_one({
+        "id": refund_id,
+        "user_id": int(user_id),
+        "amount": int(amount),
+        "phone": phone,
+        "reason": reason,
+        "date": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    return True
+
+
+async def migrate_local_sessions_to_mongo():
+    """Copy valid local Telethon sessions without deleting local files."""
+    collection = mongo_collection(MONGODB_SESSIONS_COLLECTION)
+    if collection is None:
+        return {"found": 0, "migrated": 0, "skipped": 0}
+    candidates = []
+    if os.path.exists(session_name + ".session"):
+        candidates.append(("bot", session_name, "bot"))
+    sessions_dir = "sessions"
+    if os.path.isdir(sessions_dir):
+        for filename in os.listdir(sessions_dir):
+            if filename.endswith(".session"):
+                phone = filename[:-8]
+                candidates.append((f"account:{phone}", os.path.join(sessions_dir, phone), "account"))
+    migrated = skipped = 0
+    for session_key, local_path, kind in candidates:
+        try:
+            client = TelegramClient(local_path, API_ID, API_HASH)
+            await client.connect()
+            if not await client.is_user_authorized():
+                await client.disconnect()
+                skipped += 1
+                continue
+            session_string = client.session.save()
+            if not session_string:
+                await client.disconnect()
+                skipped += 1
+                continue
+            restore = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+            await restore.connect()
+            valid = await restore.is_user_authorized()
+            await restore.disconnect()
+            await client.disconnect()
+            if not valid:
+                skipped += 1
+                continue
+            session_doc = {
+                    "session_key": session_key, "kind": kind,
+                    "session_file": local_path + ".session",
+                    "session_string": session_string,
+                    "updated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            existing = collection.find_one({"session_key": session_key}, {"_id": 0, "session_string": 1})
+            if existing and existing.get("session_string"):
+                skipped += 1
+            else:
+                collection.update_one(
+                    {"session_key": session_key},
+                    {"$set": session_doc},
+                    upsert=True,
+                )
+                migrated += 1
+        except Exception as exc:
+            logger.warning("Session migration failed for %s: %s", session_key, type(exc).__name__)
+    return {"found": len(candidates), "migrated": migrated, "skipped": skipped}
+
+
+def get_persisted_session(session_key):
+    collection = mongo_collection(MONGODB_SESSIONS_COLLECTION)
+    if collection is None:
+        return None
+    try:
+        row = collection.find_one({"session_key": session_key}, {"_id": 0, "session_string": 1})
+        return row.get("session_string") if row else None
+    except Exception as exc:
+        logger.error("Mongo session read failed: %s", type(exc).__name__)
+        return None
+
+
+def persist_client_session(session_key, client, session_file, kind="account"):
+    collection = mongo_collection(MONGODB_SESSIONS_COLLECTION)
+    if collection is None:
+        return False
+    session_string = StringSession.save(client.session)
+    if not session_string:
+        return False
+    collection.update_one(
+        {"session_key": session_key},
+        {"$set": {
+            "session_key": session_key, "kind": kind,
+            "session_file": session_file, "session_string": session_string,
+            "updated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        }},
+        upsert=True,
+    )
+    return True
+
+
+def materialize_session_file(session_string, session_file):
+    """Create a temporary Telethon SQLite file from Mongo session data."""
+    clean_path = session_file[:-8] if session_file.endswith(".session") else session_file
+    target = SQLiteSession(clean_path)
+    source = StringSession(session_string)
+    target.set_dc(source.dc_id, source.server_address, source.port)
+    target.auth_key = source.auth_key
+    target.takeout_id = source.takeout_id
+    target.save()
+    target.close()
+    return clean_path
+
+
+def delete_persisted_session(session_key):
+    collection = mongo_collection(MONGODB_SESSIONS_COLLECTION)
+    if collection is not None:
+        collection.delete_one({"session_key": session_key})
+
+
+def make_account_client(session_file, phone=None):
+    session_key = f"account:{phone}" if phone else None
+    session_string = get_persisted_session(session_key) if session_key else None
+    if session_string:
+        return TelegramClient(StringSession(session_string), API_ID, API_HASH)
+    clean_path = session_file[:-8] if session_file and session_file.endswith(".session") else session_file
+    return TelegramClient(clean_path, API_ID, API_HASH)
+
+
 validate_config()
 
 os.makedirs("sessions", exist_ok=True)
 os.makedirs("screenshots", exist_ok=True)
 
 session_name = f"bot_session_{BOT_TOKEN.split(':')[0]}"
-bot = TelegramClient(session_name, API_ID, API_HASH)
-bot.parse_mode = 'html'
+bot = None
 
 db = sqlite3.connect("otp_bot_final.db", check_same_thread=False, timeout=20)
 db.execute("PRAGMA journal_mode=WAL;")
@@ -769,7 +1226,8 @@ update_database_schema()
 
 initialize_mongodb()
 
-# Run the Mongo migration once the SQLite inventory is ready.
+# Run the Mongo migration once the SQLite database is ready.  This only
+# copies missing records into Mongo and never repopulates SQLite from Mongo.
 try:
     if mongo_ready:
         mongo_stats = migrate_sqlite_stock_to_mongo()
@@ -781,8 +1239,23 @@ try:
         logger.info("MongoDB settings migration complete: %s", settings_stats)
         migrate_sqlite_config_to_mongo()
         migrate_sqlite_terms_to_mongo()
+        primary_stats = migrate_sqlite_primary_domains_to_mongo()
+        logger.info("MongoDB primary-domain migration complete: %s", primary_stats)
+        session_stats = asyncio.get_event_loop().run_until_complete(migrate_local_sessions_to_mongo())
+        logger.info(
+            "MongoDB session migration complete: found=%s migrated=%s skipped=%s",
+            session_stats["found"], session_stats["migrated"], session_stats["skipped"],
+        )
 except Exception as exc:
     logger.warning("MongoDB migration error: %s", exc)
+
+bot_session_string = get_persisted_session("bot")
+bot = TelegramClient(
+    StringSession(bot_session_string) if bot_session_string else session_name,
+    API_ID,
+    API_HASH,
+)
+bot.parse_mode = 'html'
 
 # ================= HELPER FUNCTIONS =================
 def is_bot_online():
@@ -800,16 +1273,24 @@ def get_maintenance_message():
 def is_admin(uid):
     if uid in ADMIN_IDS:
         return True
+    if mongo_ready:
+        return get_admin_doc(uid) is not None
     row = cur.execute("SELECT user_id FROM admins WHERE user_id=?", (uid,)).fetchone()
     return bool(row)
 
 def has_perm(uid, perm):
     if uid in ADMIN_IDS:
         return True
+    if mongo_ready:
+        row = get_admin_doc(uid)
+        return bool(row and row.get(perm, 0) == 1)
     row = cur.execute(f"SELECT {perm} FROM admins WHERE user_id=?", (uid,)).fetchone()
     return bool(row and row[0] == 1)
 
 def ensure_user(uid):
+    if mongo_ready:
+        ensure_user_mongo(uid)
+        return
     cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
     db.commit()
 
@@ -849,7 +1330,10 @@ async def send_broadcast_preview(admin_id, draft):
     return await bot.send_message(admin_id, draft["text"], buttons=buttons, parse_mode="html")
 
 async def run_broadcast(admin_id, chat_id, draft):
-    users = cur.execute("SELECT user_id FROM users").fetchall()
+    if mongo_ready:
+        users = [(doc["user_id"],) for doc in mongo_collection("users").find({}, {"_id": 0, "user_id": 1})]
+    else:
+        users = cur.execute("SELECT user_id FROM users").fetchall()
     total = len(users)
     sent = failed = blocked = 0
     progress_message = await bot.send_message(
@@ -1001,10 +1485,16 @@ def parse_inr_price(value):
 
 
 def is_user_banned(uid):
+    if mongo_ready:
+        return int(get_user_value(uid, "banned", 0) or 0) == 1
     res = cur.execute("SELECT banned FROM users WHERE user_id=?", (uid,)).fetchone()
     return res and res[0] == 1
 
 def update_balance(uid, amount):
+    if mongo_ready:
+        if update_user_balance(uid, amount) is None:
+            raise ValueError(f"User {uid} does not exist")
+        return
     cur.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, uid))
     db.commit()
 
@@ -1100,11 +1590,13 @@ async def detect_account_year(client):
 
 # ================= LOGGING LOGIC =================
 async def process_referral_bonus(uid, amount):
-    row = cur.execute("SELECT referred_by FROM users WHERE user_id=?", (uid,)).fetchone()
-    ref = row[0] if row else None
+    if mongo_ready:
+        ref = get_user_value(uid, "referred_by")
+    else:
+        row = cur.execute("SELECT referred_by FROM users WHERE user_id=?", (uid,)).fetchone()
+        ref = row[0] if row else None
     if ref:
-        pct_row = cur.execute("SELECT value FROM settings WHERE key='ref_percent'").fetchone()
-        pct = float(pct_row[0]) if pct_row else 3.0
+        pct = float(get_setting("ref_percent", "3.0"))
         if pct > 0:
             bonus = int(amount * (pct / 100))
             if bonus > 0:
@@ -1196,8 +1688,7 @@ def get_join_buttons():
 
 async def send_main_menu(event, uid):
     me = await bot.get_me()
-    pct_row = cur.execute("SELECT value FROM settings WHERE key='ref_percent'").fetchone()
-    pct = pct_row[0] if pct_row else "3"
+    pct = get_setting("ref_percent", "3")
     bot_username = me.username or ""
     msg = get_welcome_message(uid, pct, bot_username)
     banner = get_banner_media() if get_setting("images_enabled", "off") == "on" else None
@@ -1368,9 +1859,12 @@ async def show_upi_qr(event, amount):
         generated_qr = f"https://quickchart.io/qr?text={encoded_upi}&size=400"
         
         # Save order
-        cur.execute("INSERT INTO upi_orders (order_id, user_id, amount, status) VALUES (?,?,?,?)", 
-                    (order_id, uid, amount, "pending"))
-        db.commit()
+        if mongo_ready:
+            create_upi_order(order_id, uid, amount)
+        else:
+            cur.execute("INSERT INTO upi_orders (order_id, user_id, amount, status) VALUES (?,?,?,?)",
+                        (order_id, uid, amount, "pending"))
+            db.commit()
         
         msg = (f"{PE_LIGHTNING} <b>UPI PAYMENT</b>\n\n"
                f"{P_MONEY} Amount: <code>₹{amount}</code>\n"
@@ -1432,7 +1926,11 @@ async def submit_utr_handler(event, order_id):
     uid = event.sender_id
     
     # Check if order exists
-    row = cur.execute("SELECT amount, status FROM upi_orders WHERE order_id=?", (order_id,)).fetchone()
+    if mongo_ready:
+        order_doc = mongo_collection("upi_orders").find_one({"order_id": order_id}, {"_id": 0, "amount": 1, "status": 1})
+        row = (order_doc["amount"], order_doc["status"]) if order_doc else None
+    else:
+        row = cur.execute("SELECT amount, status FROM upi_orders WHERE order_id=?", (order_id,)).fetchone()
     if not row:
         return await event.answer("❌ Order not found.", alert=True)
     
@@ -1483,12 +1981,15 @@ async def submit_utr_handler(event, order_id):
             amount = int(row[0])
             method = f"UPI (UTR: {utr_number})"
             
-            cur.execute("""
-                INSERT INTO deposits (user_id, amount, method_name, status, screenshot, utr) 
-                VALUES (?,?,?,?,?,?)
-            """, (uid, amount, method, "pending", screenshot_path, utr_number))
-            db.commit()
-            dep_id = cur.lastrowid
+            if mongo_ready:
+                dep_id = create_deposit(uid, amount, method, "pending", screenshot_path, utr_number)
+            else:
+                cur.execute("""
+                    INSERT INTO deposits (user_id, amount, method_name, status, screenshot, utr)
+                    VALUES (?,?,?,?,?,?)
+                """, (uid, amount, method, "pending", screenshot_path, utr_number))
+                db.commit()
+                dep_id = cur.lastrowid
             
             # Notify admin with UTR and screenshot
             cap = (f"{PE_LIGHTNING} <b>NEW UPI DEPOSIT (Needs Approval)</b>\n"
@@ -1564,7 +2065,7 @@ def get_available_account_products():
         products.sort(key=lambda item: (str(item["country"]).lower(), -(item["year"] or 0), item["price"]))
         return products
 
-    columns = {row[1] for row in cur.execute("PRAGMA table_info(stock)").fetchall()}
+    columns = {row[1] for row in cur.execute("PRAGMA table_info(stock)").fetchall()} if not mongo_ready else set()
     dc_expression = "data_center" if "data_center" in columns else "NULL"
     query = f"""
         SELECT country_icon, country_name, COALESCE(category, ''), account_year, price,
@@ -1620,7 +2121,7 @@ def get_product_stock(product):
             count += 1
         return count
 
-    columns = {row[1] for row in cur.execute("PRAGMA table_info(stock)").fetchall()}
+    columns = {row[1] for row in cur.execute("PRAGMA table_info(stock)").fetchall()} if not mongo_ready else set()
     category = normalize_optional_text(product.get("category"))
     dc = product.get("dc")
     if dc is not None and str(dc).strip().lower() in {"none", "null", ""}:
@@ -1806,8 +2307,11 @@ async def show_years(event, flow, country):
     if not rows: return await event.answer("❌ Out of stock for this country.", alert=True)
 
     uid = event.sender_id
-    disc_row = cur.execute("SELECT discount FROM users WHERE user_id=?", (uid,)).fetchone()
-    discount = disc_row[0] if disc_row else 0
+    if mongo_ready:
+        discount = int(get_user_value(uid, "discount", 0) or 0)
+    else:
+        disc_row = cur.execute("SELECT discount FROM users WHERE user_id=?", (uid,)).fetchone()
+        discount = disc_row[0] if disc_row else 0
 
     msg = f"{PE_FLOWER} <b>Select Account Year</b>\n{P_GLOBE} Country: <b>{country}</b>\n\n"
     btns = []
@@ -1824,10 +2328,14 @@ async def confirm_purchase(event, country, year, price_str, category=None, dc=No
     uid = event.sender_id
     base_price = int(price_str)
     
-    bal_row = cur.execute("SELECT balance FROM users WHERE user_id=?", (uid,)).fetchone()
-    bal = bal_row[0] if bal_row else 0
-    disc_row = cur.execute("SELECT discount FROM users WHERE user_id=?", (uid,)).fetchone()
-    discount = disc_row[0] if disc_row else 0
+    if mongo_ready:
+        bal = int(get_user_value(uid, "balance", 0) or 0)
+        discount = int(get_user_value(uid, "discount", 0) or 0)
+    else:
+        bal_row = cur.execute("SELECT balance FROM users WHERE user_id=?", (uid,)).fetchone()
+        bal = bal_row[0] if bal_row else 0
+        disc_row = cur.execute("SELECT discount FROM users WHERE user_id=?", (uid,)).fetchone()
+        discount = disc_row[0] if disc_row else 0
     final_price = base_price if discount == 0 else int(base_price * (100 - discount) / 100)
 
     msg = (f"{PE_CHECK} <b>Confirm Your Purchase</b>\n\n"
@@ -1848,8 +2356,11 @@ async def confirm_purchase(event, country, year, price_str, category=None, dc=No
 async def process_purchase(event, country, year_str, price_str, category=None, dc=None):
     uid, base_price = event.sender_id, int(price_str)
 
-    disc_row = cur.execute("SELECT discount FROM users WHERE user_id=?", (uid,)).fetchone()
-    discount = disc_row[0] if disc_row else 0
+    if mongo_ready:
+        discount = int(get_user_value(uid, "discount", 0) or 0)
+    else:
+        disc_row = cur.execute("SELECT discount FROM users WHERE user_id=?", (uid,)).fetchone()
+        discount = disc_row[0] if disc_row else 0
     final_price = base_price if discount == 0 else int(base_price * (100 - discount) / 100)
 
     columns = {row[1] for row in cur.execute("PRAGMA table_info(stock)").fetchall()}
@@ -1866,12 +2377,10 @@ async def process_purchase(event, country, year_str, price_str, category=None, d
             c_icon = row.get("country_icon") or "🌍"
             actual_year = row.get("account_year")
             twofa_pass = row.get("twofa") or "None"
-            cur.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (final_price, uid, final_price))
-            if cur.rowcount == 0:
+            charged_user = update_user_balance(uid, -final_price, require_balance=final_price)
+            if charged_user is None:
                 set_stock_available_in_mongo(phone, True)
                 return await event.answer(f"❌ Insufficient Balance! Need ₹{final_price}", alert=True)
-            cur.execute("UPDATE stock SET available=0 WHERE phone=?", (phone,))
-            db.commit()
         else:
             query = (
                 "SELECT phone, session_file, country_icon, account_year, twofa FROM stock "
@@ -1899,20 +2408,27 @@ async def process_purchase(event, country, year_str, price_str, category=None, d
             db.commit()
 
     await event.edit(f"{PE_LIGHTNING} <b>Fetching Number (+{phone})...</b>")
-    clean_sess = sess if not sess.endswith(".session") else sess[:-8]
-    client = TelegramClient(clean_sess, API_ID, API_HASH)
+    client = make_account_client(sess, phone)
     
     try:
         await client.connect()
         if not await client.is_user_authorized(): raise Exception("Session dead")
+        if mongo_ready and not persist_client_session(f"account:{phone}", client, sess):
+            raise Exception("Session could not be persisted")
     except Exception:
         async with get_user_lock(uid):
-            cur.execute("DELETE FROM stock WHERE phone=?", (phone,))
             if mongo_ready:
                 remove_stock_from_mongo(phone)
-            cur.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (final_price, uid))
-            db.commit()
+            if mongo_ready:
+                update_user_balance(uid, final_price)
+                record_refund(uid, final_price, phone, "invalid_account")
+            else:
+                cur.execute("DELETE FROM stock WHERE phone=?", (phone,))
+                cur.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (final_price, uid))
+                db.commit()
         await client.disconnect()
+        if mongo_ready:
+            delete_persisted_session(f"account:{phone}")
         delete_session_files(sess)
         return await event.edit(f"{P_NO} <b>Account Invalid.</b> Money refunded. Try buying another.")
 
@@ -1959,9 +2475,12 @@ async def auto_otp_task(phone):
                 if not order['paid']:
                     order['paid'] = True
                     async with get_user_lock(uid):
-                        cur.execute("INSERT INTO orders (user_id, country, year, price, phone, otp) VALUES (?,?,?,?,?,?)", (uid, order['country'], order['year'], order['price'], phone, code))
-                        cur.execute("DELETE FROM stock WHERE phone=?", (phone,))
-                        db.commit()
+                        if mongo_ready:
+                            add_order(uid, order['country'], order['year'], order['price'], phone, code)
+                        else:
+                            cur.execute("INSERT INTO orders (user_id, country, year, price, phone, otp) VALUES (?,?,?,?,?,?)", (uid, order['country'], order['year'], order['price'], phone, code))
+                            cur.execute("DELETE FROM stock WHERE phone=?", (phone,))
+                            db.commit()
                     
                     await log_primary_purchase(uid, order['country'], order['price'], order['price'], order['year'], 1)
                 
@@ -1987,11 +2506,14 @@ async def auto_otp_task(phone):
         except: pass
         
         async with get_user_lock(uid):
-            cur.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (order['price'], uid))
-            cur.execute("UPDATE stock SET available=1 WHERE phone=?", (phone,))
             if mongo_ready:
+                update_user_balance(uid, order['price'])
                 set_stock_available_in_mongo(phone, True)
-            db.commit()
+                record_refund(uid, order['price'], phone, "order_timeout")
+            else:
+                cur.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (order['price'], uid))
+                cur.execute("UPDATE stock SET available=1 WHERE phone=?", (phone,))
+                db.commit()
             
         try: await bot.edit_message(uid, msg_id, f"{P_TIME} <b>Order Expired!</b>\nThe 10-minute limit for <code>{phone}</code> ran out. Your money ({P_INR}{order['price']}) has been automatically refunded.")
         except: pass
@@ -2018,8 +2540,11 @@ async def init_session_purchase(event, country, year, price_str, category=None, 
     if stock == 0: return await event.answer("❌ Out of stock!", alert=True)
     
     session_buy_state[uid] = {'country': country, 'year': year, 'price': price, 'stock': stock, 'category': category, 'dc': dc}
-    disc_row = cur.execute("SELECT discount FROM users WHERE user_id=?", (uid,)).fetchone()
-    discount = disc_row[0] if disc_row else 0
+    if mongo_ready:
+        discount = int(get_user_value(uid, "discount", 0) or 0)
+    else:
+        disc_row = cur.execute("SELECT discount FROM users WHERE user_id=?", (uid,)).fetchone()
+        discount = disc_row[0] if disc_row else 0
     p_disp = price if discount == 0 else int(price * (100 - discount) / 100)
     
     msg = (f"{PE_GIFT} <b>Buy {country} ({year}) Sessions</b>\n\n"
@@ -2048,15 +2573,12 @@ async def process_bulk_sessions(event, uid, qty, state, final_cost):
                 rows.append((doc.get("phone"), doc.get("session_file"), doc.get("twofa") or "None", doc.get("account_year")))
             if len(rows) < qty:
                 return await event.respond(f"{P_NO} Stock changed during processing. Purchase Cancelled.")
-            cur.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (final_cost, uid, final_cost))
-            if cur.rowcount == 0:
+            charged_user = update_user_balance(uid, -final_cost, require_balance=final_cost)
+            if charged_user is None:
                 for claimed_phone, _, _, _ in rows:
                     set_stock_available_in_mongo(claimed_phone, True)
                 return await event.respond(f"{P_NO} Insufficient Balance! Purchase Cancelled.")
             phones = [r[0] for r in rows]
-            for phone, _, _, _ in rows:
-                cur.execute("UPDATE stock SET available=0 WHERE phone=?", (phone,))
-            db.commit()
             price_per_acc = final_cost // qty
         else:
             columns = {row[1] for row in cur.execute("PRAGMA table_info(stock)").fetchall()}
@@ -2085,8 +2607,12 @@ async def process_bulk_sessions(event, uid, qty, state, final_cost):
 
             price_per_acc = final_cost // qty
         for p in phones:
-            cur.execute("INSERT INTO orders (user_id, country, price, phone, otp) VALUES (?,?,?,?,?)", (uid, country, price_per_acc, p, "SESSION_FILES"))
-        db.commit()
+            if mongo_ready:
+                add_order(uid, country, year, price_per_acc, p, "SESSION_FILES")
+            else:
+                cur.execute("INSERT INTO orders (user_id, country, price, phone, otp) VALUES (?,?,?,?,?)", (uid, country, price_per_acc, p, "SESSION_FILES"))
+        if not mongo_ready:
+            db.commit()
 
     zip_name = f"sessions_{uid}_{int(time.time())}.zip"
     numbers_txt = ""
@@ -2097,7 +2623,14 @@ async def process_bulk_sessions(event, uid, qty, state, final_cost):
                 base_s = sess_file if not sess_file.endswith(".session") else sess_file[:-8]
                 for ext in ['.session', '.session-wal', '.session-shm', '.session-journal']:
                     src = base_s + ext
-                    if os.path.exists(src): zf.write(src, os.path.basename(src))
+                    if os.path.exists(src):
+                        zf.write(src, os.path.basename(src))
+                    elif ext == ".session" and mongo_ready:
+                        session_string = get_persisted_session(f"account:{phone}")
+                        if session_string:
+                            materialize_session_file(session_string, src)
+                            if os.path.exists(src):
+                                zf.write(src, os.path.basename(src))
                 
                 pass_text = twofa_pass if twofa_pass != "None" else "No_Password"
                 numbers_txt += f"+{phone} | pass:{pass_text}\n"
@@ -2115,12 +2648,21 @@ async def process_bulk_sessions(event, uid, qty, state, final_cost):
 # ================= STATS & PROFILE FUNCTIONS =================
 async def profile_handler(event):
     uid = event.sender_id
-    row = cur.execute("SELECT balance, total_deposited, joined_date, discount FROM users WHERE user_id=?", (uid,)).fetchone()
-    if not row: return await bot.send_message(event.chat_id, "⚠️ Error: Please type /start to initialize your account.")
-    
-    bal, dep, date, discount = row
-    ref_count_row = cur.execute("SELECT COUNT(*) FROM users WHERE referred_by=?", (uid,)).fetchone()
-    ref_count = ref_count_row[0] if ref_count_row else 0
+    if mongo_ready:
+        user = get_user_doc(uid)
+        if not user:
+            return await bot.send_message(event.chat_id, "⚠️ Error: Please type /start to initialize your account.")
+        bal = int(user.get("balance") or 0)
+        dep = int(user.get("total_deposited") or 0)
+        date = user.get("joined_date")
+        discount = int(user.get("discount") or 0)
+        ref_count = count_users({"referred_by": uid})
+    else:
+        row = cur.execute("SELECT balance, total_deposited, joined_date, discount FROM users WHERE user_id=?", (uid,)).fetchone()
+        if not row: return await bot.send_message(event.chat_id, "⚠️ Error: Please type /start to initialize your account.")
+        bal, dep, date, discount = row
+        ref_count_row = cur.execute("SELECT COUNT(*) FROM users WHERE referred_by=?", (uid,)).fetchone()
+        ref_count = ref_count_row[0] if ref_count_row else 0
     me = await bot.get_me()
     bot_username = me.username or ""
     ref_link = f"https://t.me/{bot_username}?start=ref_{uid}" if bot_username else None
@@ -2141,14 +2683,21 @@ async def profile_handler(event):
 
 async def stats_handler(event, is_callback=False):
     uid = event.sender_id
-    row = cur.execute("SELECT total_deposited FROM users WHERE user_id=?", (uid,)).fetchone()
-    if not row: return
-    dep = row[0]
-    o_row = cur.execute("SELECT COUNT(*), SUM(price) FROM orders WHERE user_id=?", (uid,)).fetchone()
-    total_orders = o_row[0] if o_row else 0
-    spent = o_row[1] if o_row and o_row[1] else 0
-    ref_row = cur.execute("SELECT COUNT(*) FROM users WHERE referred_by=?", (uid,)).fetchone()
-    ref_count = ref_row[0] if ref_row else 0
+    if mongo_ready:
+        user = get_user_doc(uid)
+        if not user: return
+        dep = int(user.get("total_deposited") or 0)
+        total_orders, spent = mongo_order_summary(uid)
+        ref_count = count_users({"referred_by": uid})
+    else:
+        row = cur.execute("SELECT total_deposited FROM users WHERE user_id=?", (uid,)).fetchone()
+        if not row: return
+        dep = row[0]
+        o_row = cur.execute("SELECT COUNT(*), SUM(price) FROM orders WHERE user_id=?", (uid,)).fetchone()
+        total_orders = o_row[0] if o_row else 0
+        spent = o_row[1] if o_row and o_row[1] else 0
+        ref_row = cur.execute("SELECT COUNT(*) FROM users WHERE referred_by=?", (uid,)).fetchone()
+        ref_count = ref_row[0] if ref_row else 0
     
     msg = (f"{PE_CROWN} <b>My Statistics</b>\n\n"
            f"{P_CART} <b>Accounts Bought:</b> {total_orders}\n"
@@ -2165,9 +2714,17 @@ async def stats_handler(event, is_callback=False):
 async def send_purchase_page(event, uid, page):
     limit = 5
     offset = (page - 1) * limit
-    t_row = cur.execute("SELECT COUNT(*) FROM orders WHERE user_id=?", (uid,)).fetchone()
-    total = t_row[0] if t_row else 0
-    rows = cur.execute("SELECT phone, date FROM orders WHERE user_id=? ORDER BY id DESC LIMIT ? OFFSET ?", (uid, limit, offset)).fetchall()
+    if mongo_ready:
+        order_collection = mongo_collection("orders")
+        total = order_collection.count_documents({"user_id": int(uid)})
+        rows = list(order_collection.find(
+            {"user_id": int(uid)}, {"_id": 0, "phone": 1, "date": 1}
+        ).sort("id", -1).skip(offset).limit(limit))
+        rows = [(row.get("phone"), row.get("date")) for row in rows]
+    else:
+        t_row = cur.execute("SELECT COUNT(*) FROM orders WHERE user_id=?", (uid,)).fetchone()
+        total = t_row[0] if t_row else 0
+        rows = cur.execute("SELECT phone, date FROM orders WHERE user_id=? ORDER BY id DESC LIMIT ? OFFSET ?", (uid, limit, offset)).fetchall()
     
     msg = f"{PE_FLOWER} <b>Purchase History</b>\nPage {page}\n\n"
     if not rows: msg += "No purchases found."
@@ -2187,8 +2744,12 @@ async def send_purchase_page(event, uid, page):
     await event.edit(msg, buttons=[nav])
 
 async def view_referrals(event):
-    refs = cur.execute("SELECT user_id FROM users WHERE referred_by=?", (event.sender_id,)).fetchall()
-    await event.answer(f"👥 You have referred {len(refs)} user(s).", alert=True)
+    if mongo_ready:
+        count = count_users({"referred_by": int(event.sender_id)})
+    else:
+        refs = cur.execute("SELECT user_id FROM users WHERE referred_by=?", (event.sender_id,)).fetchall()
+        count = len(refs)
+    await event.answer(f"👥 You have referred {count} user(s).", alert=True)
 
 # ================= ADMIN ACTIONS =================
 async def admin_panel_handler(event):
@@ -2196,9 +2757,9 @@ async def admin_panel_handler(event):
     if not is_admin(uid): return
     
     status_text = "🟢 Bot is ON" if is_bot_online() else "🔴 Bot is OFF"
-    total_users = cur.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    total_users = count_users() if mongo_ready else cur.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     total_stock = inventory_count_from_mongo({"available": 1}) if mongo_ready else cur.execute("SELECT COUNT(*) FROM stock WHERE available=1").fetchone()[0]
-    pending_deposits = cur.execute("SELECT COUNT(*) FROM deposits WHERE status='pending'").fetchone()[0]
+    pending_deposits = mongo_deposit_summary(status="pending")[0] if mongo_ready else cur.execute("SELECT COUNT(*) FROM deposits WHERE status='pending'").fetchone()[0]
     btns = []
     
     if uid in ADMIN_IDS or has_perm(uid, 'p_settings'):
@@ -2288,6 +2849,83 @@ async def render_admin_stats(event, period="all"):
     if not has_perm(event.sender_id, 'p_stats'):
         return await event.answer("Not authorized.", alert=True)
     label, since = get_stats_period(period)
+    if mongo_ready:
+        user_docs = list(mongo_collection("users").find({}, {"_id": 0}))
+        deposit_docs = list(mongo_collection("deposits").find({}, {"_id": 0}))
+        order_docs = list(mongo_collection("orders").find({}, {"_id": 0}))
+        if period == "all":
+            in_period = lambda value: True
+        else:
+            now = datetime.now()
+            if period == "today":
+                cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            elif period == "week":
+                cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                cutoff -= timedelta(days=cutoff.weekday())
+            else:
+                cutoff = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            cutoff_text = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+            in_period = lambda value: str(value or "") >= cutoff_text
+
+        total_users = len(user_docs)
+        period_users = sum(1 for doc in user_docs if in_period(doc.get("joined_date")))
+        banned_users = sum(1 for doc in user_docs if int(doc.get("banned", 0) or 0) == 1)
+        total_balance = sum(int(doc.get("balance", 0) or 0) for doc in user_docs)
+        total_upi_revenue = get_setting("upi_revenue", "0")
+        approved_deposits = [doc for doc in deposit_docs if doc.get("status") == "approved"]
+        period_approved = [doc for doc in approved_deposits if in_period(doc.get("date"))]
+        total_deposits = sum(int(doc.get("total_deposited", 0) or 0) for doc in user_docs)
+        period_deposit_count = len(period_approved)
+        period_deposits = sum(int(doc.get("amount", 0) or 0) for doc in period_approved)
+        period_orders_docs = [doc for doc in order_docs if in_period(doc.get("date"))]
+        period_orders = len(period_orders_docs)
+        period_sales = sum(int(doc.get("price", 0) or 0) for doc in period_orders_docs)
+        total_orders = len(order_docs)
+        total_sales = sum(int(doc.get("price", 0) or 0) for doc in order_docs)
+        referral_users = [doc for doc in user_docs if doc.get("referred_by") is not None]
+        total_referrals = len(referral_users)
+        period_referrals = sum(1 for doc in referral_users if in_period(doc.get("joined_date")))
+        counts = {}
+        for doc in referral_users:
+            referrer = doc.get("referred_by")
+            counts[referrer] = counts.get(referrer, 0) + 1
+        top_referrers = sorted(counts.items(), key=lambda item: item[1], reverse=True)[:3]
+        available_stock = inventory_count_from_mongo({"available": 1})
+        used_stock = inventory_count_from_mongo({"available": 0})
+        pending_deposits = sum(1 for doc in deposit_docs if doc.get("status") == "pending")
+        top_text = "Unavailable"
+        if top_referrers:
+            top_text = "\n".join(f"<code>{referrer}</code>: {count}" for referrer, count in top_referrers)
+        return await event.edit(
+            f"{P_STATS} <b>ADVANCED STATISTICS</b>\n"
+            f"📅 Period: <b>{label}</b>\n\n"
+            f"{P_USERS} <b>USERS</b>\n"
+            f"Total: <b>{total_users}</b> | In period: <b>{period_users}</b>\n"
+            f"Banned: <b>{banned_users}</b>\n\n"
+            f"{P_MONEY} <b>FINANCIAL</b>\n"
+            f"Total deposits: <b>{P_INR}{total_deposits}</b>\n"
+            f"In period: <b>{P_INR}{period_deposits}</b> ({period_deposit_count} approved)\n"
+            f"Total UPI revenue: <b>{P_INR}{html.escape(str(total_upi_revenue))}</b>\n"
+            f"Total sales/revenue: <b>{P_INR}{total_sales}</b>\n"
+            f"Period sales/revenue: <b>{P_INR}{period_sales}</b>\n\n"
+            f"{P_CART} <b>ORDERS / STOCK</b>\n"
+            f"Total orders: <b>{total_orders}</b> | In period: <b>{period_orders}</b>\n"
+            f"Pending deposits: <b>{pending_deposits}</b>\n"
+            f"Pending/completed/cancelled orders: <i>Unavailable (not stored)</i>\n"
+            f"Available stock: <b>{available_stock}</b>\n"
+            f"Used stock records: <b>{used_stock}</b>\n"
+            f"Overall user balance: <b>{P_INR}{total_balance}</b>\n\n"
+            f"{P_GIFT} <b>REFERRALS</b>\n"
+            f"Total referrals: <b>{total_referrals}</b> | In period: <b>{period_referrals}</b>\n"
+            f"Referral rewards issued: <i>Unavailable (not stored)</i>\n"
+            f"Top referrers:\n{top_text}",
+            buttons=[
+                [Button.inline("Today", "adm_statsp|today"), Button.inline("This Week", "adm_statsp|week")],
+                [Button.inline("This Month", "adm_statsp|month"), Button.inline("All Time", "adm_statsp|all")],
+                [Button.inline("🔄 Refresh", f"adm_statsp|{period}")],
+                [Button.inline("◀️ Back", "adm_adminmain")]
+            ],
+        )
     date_filter = "" if period == "all" else " AND date >= " + since
     user_filter = "" if period == "all" else " WHERE joined_date >= " + since
 
@@ -2363,7 +3001,10 @@ async def render_admin_stats(event, period="all"):
     await event.edit(msg, buttons=buttons)
 
 async def manage_admins_menu(event):
-    rows = cur.execute("SELECT user_id FROM admins").fetchall()
+    if mongo_ready:
+        rows = [(doc.get("user_id"),) for doc in list_admin_docs()]
+    else:
+        rows = cur.execute("SELECT user_id FROM admins").fetchall()
     msg = f"{PE_CROWN} <b>Manage Sub-Admins</b>\n\n"
     for r in rows: msg += f"{P_ACC} <code>{r[0]}</code>\n"
     btns = [[Button.inline("Add Admin", "adm_addadmin"), Button.inline("Edit Admin", "adm_editadminreq")],
@@ -2371,10 +3012,18 @@ async def manage_admins_menu(event):
     await event.edit(msg, buttons=btns)
 
 async def render_user_management(event, target_id):
-    row = cur.execute(
-        "SELECT user_id, balance, referred_by, total_deposited, joined_date, banned, discount "
-        "FROM users WHERE user_id=?", (target_id,)
-    ).fetchone()
+    if mongo_ready:
+        user = get_user_doc(target_id)
+        row = (
+            user.get("user_id"), user.get("balance", 0), user.get("referred_by"),
+            user.get("total_deposited", 0), user.get("joined_date"),
+            user.get("banned", 0), user.get("discount", 0)
+        ) if user else None
+    else:
+        row = cur.execute(
+            "SELECT user_id, balance, referred_by, total_deposited, joined_date, banned, discount "
+            "FROM users WHERE user_id=?", (target_id,)
+        ).fetchone()
     if not row:
         return await event.edit(f"{P_NO} <b>User not found.</b>", buttons=[[Button.inline("Back", "adm_adminmain")]])
 
@@ -2388,11 +3037,16 @@ async def render_user_management(event, target_id):
     except Exception:
         pass
 
-    order_row = cur.execute("SELECT COUNT(*), COALESCE(SUM(price), 0) FROM orders WHERE user_id=?", (user_id,)).fetchone()
-    deposit_row = cur.execute(
-        "SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM deposits WHERE user_id=? AND status='approved'", (user_id,)
-    ).fetchone()
-    referral_count = cur.execute("SELECT COUNT(*) FROM users WHERE referred_by=?", (user_id,)).fetchone()[0]
+    if mongo_ready:
+        order_row = mongo_order_summary(user_id)
+        deposit_row = mongo_deposit_summary(user_id, "approved")
+        referral_count = count_users({"referred_by": int(user_id)})
+    else:
+        order_row = cur.execute("SELECT COUNT(*), COALESCE(SUM(price), 0) FROM orders WHERE user_id=?", (user_id,)).fetchone()
+        deposit_row = cur.execute(
+            "SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM deposits WHERE user_id=? AND status='approved'", (user_id,)
+        ).fetchone()
+        referral_count = cur.execute("SELECT COUNT(*) FROM users WHERE referred_by=?", (user_id,)).fetchone()[0]
     order_count, spent = order_row
     approved_count, approved_total = deposit_row
 
@@ -2436,7 +3090,11 @@ async def start_user_search(event, action):
             if not value.isdigit() or int(value) <= 0:
                 return await conv.send_message(f"{P_NO} Enter a valid numeric Telegram user ID.")
             target_id = int(value)
-            if not cur.execute("SELECT 1 FROM users WHERE user_id=?", (target_id,)).fetchone():
+            if mongo_ready:
+                exists = get_user_doc(target_id) is not None
+            else:
+                exists = cur.execute("SELECT 1 FROM users WHERE user_id=?", (target_id,)).fetchone() is not None
+            if not exists:
                 return await conv.send_message(f"{P_NO} <b>User not found.</b>")
             if action == "balance":
                 await conv.send_message(
@@ -2464,8 +3122,12 @@ async def start_user_search(event, action):
             await conv.send_message(f"{P_NO} Timed out. Please try again.")
 
 async def confirm_balance_change(event, target_id, amount):
-    row = cur.execute("SELECT balance FROM users WHERE user_id=?", (target_id,)).fetchone()
-    if not row:
+    if mongo_ready:
+        current_balance = get_user_value(target_id, "balance")
+        row = (int(current_balance or 0),) if get_user_doc(target_id) else None
+    else:
+        row = cur.execute("SELECT balance FROM users WHERE user_id=?", (target_id,)).fetchone()
+    if row is None:
         return await event.answer("User not found.", alert=True)
     new_balance = row[0] + amount
     if new_balance < 0:
@@ -2482,7 +3144,8 @@ async def confirm_balance_change(event, target_id, amount):
     )
 
 async def start_balance_for_user(event, target_id):
-    if not cur.execute("SELECT 1 FROM users WHERE user_id=?", (target_id,)).fetchone():
+    exists = get_user_doc(target_id) is not None if mongo_ready else cur.execute("SELECT 1 FROM users WHERE user_id=?", (target_id,)).fetchone() is not None
+    if not exists:
         return await event.answer("User not found.", alert=True)
     async with bot.conversation(event.chat_id, timeout=180) as conv:
         try:
@@ -2505,7 +3168,11 @@ async def start_balance_for_user(event, target_id):
             await conv.send_message(f"{P_NO} Timed out. Please try again.")
 
 async def edit_admin_menu(event, target_id):
-    row = cur.execute("SELECT p_add_stock, p_manage_stock, p_stats, p_bal, p_settings FROM admins WHERE user_id=?", (target_id,)).fetchone()
+    if mongo_ready:
+        doc = get_admin_doc(target_id)
+        row = tuple(int(doc.get(permission, 0) or 0) for permission in ADMIN_PERMISSIONS) if doc else None
+    else:
+        row = cur.execute("SELECT p_add_stock, p_manage_stock, p_stats, p_bal, p_settings FROM admins WHERE user_id=?", (target_id,)).fetchone()
     if not row: return await event.answer("Admin not found", alert=True)
     p = ["✅" if x==1 else "❌" for x in row]
     
@@ -2800,11 +3467,17 @@ async def admin_actions(event):
         if not pending or pending.get("target_id") != target_id:
             return await event.answer("This confirmation has expired.", alert=True)
         amount = pending["amount"]
-        cur.execute("UPDATE users SET balance=balance+? WHERE user_id=? AND balance+? >= 0", (amount, target_id, amount))
-        if cur.rowcount != 1:
-            db.rollback()
-            return await event.answer("Balance change was not applied.", alert=True)
-        db.commit()
+        if mongo_ready:
+            current = get_user_doc(target_id)
+            if not current or int(current.get("balance", 0) or 0) + amount < 0:
+                return await event.answer("Balance change was not applied.", alert=True)
+            update_user_balance(target_id, amount)
+        else:
+            cur.execute("UPDATE users SET balance=balance+? WHERE user_id=? AND balance+? >= 0", (amount, target_id, amount))
+            if cur.rowcount != 1:
+                db.rollback()
+                return await event.answer("Balance change was not applied.", alert=True)
+            db.commit()
         await event.answer("Balance updated.", alert=True)
         return await render_user_management(event, target_id)
 
@@ -2813,7 +3486,11 @@ async def admin_actions(event):
             return await event.answer("Not authorized.", alert=True)
         _, target_text, desired_text = action_data.split("|")
         target_id, desired = int(target_text), int(desired_text)
-        row = cur.execute("SELECT banned FROM users WHERE user_id=?", (target_id,)).fetchone()
+        if mongo_ready:
+            user = get_user_doc(target_id)
+            row = (int(user.get("banned", 0) or 0),) if user else None
+        else:
+            row = cur.execute("SELECT banned FROM users WHERE user_id=?", (target_id,)).fetchone()
         if not row:
             return await event.answer("User not found.", alert=True)
         if row[0] != desired:
@@ -2833,8 +3510,11 @@ async def admin_actions(event):
         pending = admin_user_state.pop(uid, None)
         if not pending or pending.get("ban_target") != target_id or pending.get("ban_value") != desired:
             return await event.answer("This confirmation has expired.", alert=True)
-        cur.execute("UPDATE users SET banned=? WHERE user_id=?", (desired, target_id))
-        db.commit()
+        if mongo_ready:
+            update_user_fields(target_id, {"banned": desired})
+        else:
+            cur.execute("UPDATE users SET banned=? WHERE user_id=?", (desired, target_id))
+            db.commit()
         await event.answer("User status updated.", alert=True)
         return await render_user_management(event, target_id)
 
@@ -2961,14 +3641,21 @@ async def admin_actions(event):
 
     elif action_data.startswith("tglperm|") and uid in ADMIN_IDS:
         _, t_id, p_name = action_data.split("|")
-        cur.execute(f"UPDATE admins SET {p_name} = CASE WHEN {p_name}=1 THEN 0 ELSE 1 END WHERE user_id=?", (t_id,))
-        db.commit()
+        if mongo_ready:
+            admin = get_admin_doc(t_id)
+            set_admin_permission(t_id, p_name, not bool(admin and admin.get(p_name, 0)))
+        else:
+            cur.execute(f"UPDATE admins SET {p_name} = CASE WHEN {p_name}=1 THEN 0 ELSE 1 END WHERE user_id=?", (t_id,))
+            db.commit()
         return await edit_admin_menu(event, t_id)
         
     elif action_data.startswith("deladmin|") and uid in ADMIN_IDS:
         t_id = action_data.split("|")[1]
-        cur.execute("DELETE FROM admins WHERE user_id=?", (t_id,))
-        db.commit()
+        if mongo_ready:
+            delete_admin(t_id)
+        else:
+            cur.execute("DELETE FROM admins WHERE user_id=?", (t_id,))
+            db.commit()
         await event.answer("✅ Admin Removed", alert=True)
         return await manage_admins_menu(event)
 
@@ -2986,9 +3673,16 @@ async def admin_actions(event):
         return await send_autoprice_country(event, action_data.split("|")[1])
         
     elif action_data == "backupusr" and (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
-        cur.execute("SELECT * FROM users")
         with open("users_backup.csv", "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f); w.writerow([i[0] for i in cur.description]); w.writerows(cur.fetchall())
+            columns = ["user_id", "balance", "referred_by", "total_deposited", "joined_date", "banned", "discount", "terms_accepted"]
+            w = csv.writer(f)
+            w.writerow(columns)
+            if mongo_ready:
+                for user in mongo_collection("users").find({}, {"_id": 0}):
+                    w.writerow([user.get(column) for column in columns])
+            else:
+                cur.execute("SELECT * FROM users")
+                w.writerows(cur.fetchall())
         await bot.send_file(chat, "users_backup.csv", caption=f"{P_USERS} <b>Users Backup CSV</b>")
         os.remove("users_backup.csv")
         return await event.answer("✅ Backup Generated!", alert=True)
@@ -3014,8 +3708,14 @@ async def admin_actions(event):
 
             elif action_data == "addadmin" and uid in ADMIN_IDS:
                 new_ad = int((await get_reply(f"{P_ACC} <b>Enter User ID for new Admin:</b>")).text)
-                cur.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (new_ad,))
-                db.commit()
+                if mongo_ready:
+                    _mongo_update_missing(
+                        mongo_collection("admins"), ("user_id", new_ad),
+                        {"user_id": new_ad, **{permission: 0 for permission in ADMIN_PERMISSIONS}},
+                    )
+                else:
+                    cur.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (new_ad,))
+                    db.commit()
                 await conv.send_message(f"{P_YES} Admin added!")
                 class FakeEvent: 
                     async def edit(self, text, buttons): await bot.send_message(chat, text, buttons=buttons)
@@ -3136,6 +3836,11 @@ async def admin_actions(event):
                         pwd = await client(GetPasswordRequest())
                         has_2fa = pwd.has_password
                         year = await detect_account_year(client)
+                        if mongo_ready and not persist_client_session(
+                            f"account:{phone}", client, f"sessions/{phone}.session"
+                        ):
+                            await client.disconnect()
+                            raise RuntimeError("Mongo session persistence failed")
                         await client.disconnect()
 
                         key = (c_name, year, has_2fa)
@@ -3260,6 +3965,11 @@ async def admin_actions(event):
                 auto_year = await detect_account_year(client)
                 if year is None:
                     year = auto_year
+                if mongo_ready and not persist_client_session(
+                    f"account:{phone}", client, f"sessions/{phone}.session"
+                ):
+                    await client.disconnect()
+                    raise RuntimeError("Mongo session persistence failed")
                 await client.disconnect()
 
                 stock_columns = {row[1] for row in cur.execute("PRAGMA table_info(stock)").fetchall()}
@@ -3325,8 +4035,11 @@ async def admin_actions(event):
             elif action_data == "discount" and (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
                 t_uid = int((await get_reply(f"{P_ACC} <b>User ID:</b>")).text)
                 pct = int((await get_reply(f"{P_GIFT} <b>Discount % (0 to remove):</b>")).text)
-                cur.execute("UPDATE users SET discount=? WHERE user_id=?", (pct, t_uid))
-                db.commit()
+                if mongo_ready:
+                    update_user_fields(t_uid, {"discount": pct})
+                else:
+                    cur.execute("UPDATE users SET discount=? WHERE user_id=?", (pct, t_uid))
+                    db.commit()
                 await conv.send_message(f"{P_YES} User {t_uid} has {pct}% discount.")
                 
             elif action_data == "refpct" and (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
@@ -3347,11 +4060,24 @@ async def admin_actions(event):
                     reader = csv.reader(f); next(reader); count = 0
                     for row in reader:
                         try:
-                            cur.execute("INSERT OR REPLACE INTO users (user_id, balance, referred_by, total_deposited, joined_date, banned, discount, terms_accepted) VALUES (?,?,?,?,?,?,?,?)", 
-                                        (int(row[0]), int(row[1]), row[2] if row[2] else None, int(row[3]), row[4], int(row[5]), int(row[6]), int(row[7])))
+                            values = {
+                                "user_id": int(row[0]), "balance": int(row[1]),
+                                "referred_by": int(row[2]) if row[2] and str(row[2]).lower() not in {"none", "null"} else None,
+                                "total_deposited": int(row[3]), "joined_date": row[4],
+                                "banned": int(row[5]), "discount": int(row[6]),
+                                "terms_accepted": str(row[7]).strip().lower() in {"1", "true", "yes"},
+                            }
+                            if mongo_ready:
+                                mongo_collection("users").update_one(
+                                    {"user_id": values["user_id"]}, {"$set": values}, upsert=True
+                                )
+                            else:
+                                cur.execute("INSERT OR REPLACE INTO users (user_id, balance, referred_by, total_deposited, joined_date, banned, discount, terms_accepted) VALUES (?,?,?,?,?,?,?,?)",
+                                            tuple(values[field] for field in ("user_id", "balance", "referred_by", "total_deposited", "joined_date", "banned", "discount", "terms_accepted")))
                             count += 1
                         except: pass
-                db.commit()
+                if not mongo_ready:
+                    db.commit()
                 os.remove("temp_restore.csv")
                 await conv.send_message(f"{P_YES} Restored {count} users.")
 
@@ -3380,8 +4106,14 @@ async def handle_start(e):
             if start_param.startswith("ref_"):
                 ref = start_param.replace("ref_", "")
                 if ref.isdigit() and int(ref) != uid:
-                    cur.execute("UPDATE users SET referred_by=? WHERE user_id=? AND referred_by IS NULL", (int(ref), uid))
-                    db.commit()
+                    if mongo_ready:
+                        mongo_collection("users").update_one(
+                            {"user_id": uid, "$or": [{"referred_by": None}, {"referred_by": {"$exists": False}}]},
+                            {"$set": {"referred_by": int(ref)}},
+                        )
+                    else:
+                        cur.execute("UPDATE users SET referred_by=? WHERE user_id=? AND referred_by IS NULL", (int(ref), uid))
+                        db.commit()
 
         is_joined = await check_channel_joined(uid)
         if not is_joined:
@@ -3424,10 +4156,13 @@ async def handle_all_messages(e):
                 os.makedirs("screenshots", exist_ok=True)
                 await bot.download_media(e.photo, screenshot_path)
             
-            cur.execute("INSERT INTO deposits (user_id, amount, method_name, status, screenshot) VALUES (?,?,?,?,?)", 
-                       (uid, final_amt, info['method'], "pending", screenshot_path))
-            db.commit()
-            dep_id = cur.lastrowid
+            if mongo_ready:
+                dep_id = create_deposit(uid, final_amt, info['method'], "pending", screenshot_path)
+            else:
+                cur.execute("INSERT INTO deposits (user_id, amount, method_name, status, screenshot) VALUES (?,?,?,?,?)",
+                           (uid, final_amt, info['method'], "pending", screenshot_path))
+                db.commit()
+                dep_id = cur.lastrowid
             await e.reply(f"{PE_GIFT} Deposit request submitted! Please wait for admin approval.")
             
             cap = (f"{PE_LIGHTNING} <b>💰 Deposit Request</b>\n\n"
@@ -3535,8 +4270,11 @@ async def handle_all_messages(e):
             st = admin_dep_state[uid]
             if st['step'] == 'wait_reason':
                 t_uid, dep_id, msg_id = st['target_uid'], st['dep_id'], st['msg_id']
-                cur.execute("UPDATE deposits SET status='rejected' WHERE id=?", (dep_id,))
-                db.commit()
+                if mongo_ready:
+                    update_deposit(dep_id, {"status": "rejected", "rejection_reason": text}, "pending")
+                else:
+                    cur.execute("UPDATE deposits SET status='rejected' WHERE id=?", (dep_id,))
+                    db.commit()
                 
                 try: await bot.edit_message(LOG_CHANNEL_ID, msg_id, f"{P_NO} <b>REJECTED USER {t_uid}</b>\nReason: {html.escape(text)}")
                 except: pass
@@ -3553,13 +4291,19 @@ async def handle_all_messages(e):
                 if qty < 1: raise ValueError
                 if qty > state['stock']: return await e.respond(f"{P_WARN} <b>Not enough stock!</b> Max is {state['stock']}.")
                 
-                disc_row = cur.execute("SELECT discount FROM users WHERE user_id=?", (uid,)).fetchone()
-                discount = disc_row[0] if disc_row else 0
+                if mongo_ready:
+                    discount = int(get_user_value(uid, "discount", 0) or 0)
+                else:
+                    disc_row = cur.execute("SELECT discount FROM users WHERE user_id=?", (uid,)).fetchone()
+                    discount = disc_row[0] if disc_row else 0
                 total_cost = qty * state['price']
                 if discount > 0: total_cost = int(total_cost * (100 - discount) / 100)
                     
-                bal_row = cur.execute("SELECT balance FROM users WHERE user_id=?", (uid,)).fetchone()
-                user_bal = bal_row[0] if bal_row else 0
+                if mongo_ready:
+                    user_bal = int(get_user_value(uid, "balance", 0) or 0)
+                else:
+                    bal_row = cur.execute("SELECT balance FROM users WHERE user_id=?", (uid,)).fetchone()
+                    user_bal = bal_row[0] if bal_row else 0
                 if user_bal < total_cost: return await e.respond(f"{P_NO} <b>Insufficient Balance!</b>\nYou need {P_INR}{total_cost} to buy {qty} sessions.")
 
                 session_buy_state.pop(uid)
@@ -3814,7 +4558,14 @@ async def handle_callback_query(e):
         elif data.startswith("dkp|") and has_perm(uid, 'p_bal'):
             _, dep_id, action = data.split("|")
             dep_id = int(dep_id)
-            row = cur.execute("SELECT user_id, method_name, status, amount FROM deposits WHERE id=?", (dep_id,)).fetchone()
+            if mongo_ready:
+                dep_doc = get_mongo_deposit(dep_id)
+                row = (
+                    dep_doc.get("user_id"), dep_doc.get("method_name"),
+                    dep_doc.get("status"), dep_doc.get("amount")
+                ) if dep_doc else None
+            else:
+                row = cur.execute("SELECT user_id, method_name, status, amount FROM deposits WHERE id=?", (dep_id,)).fetchone()
             if not row or row[2] != 'pending': return await e.edit(f"{P_WARN} Already processed.")
             t_uid, method, orig_amt = row[0], row[1], row[3]
             
@@ -3834,12 +4585,20 @@ async def handle_callback_query(e):
                 if amt <= 0: return await e.answer("Amount must be > 0", alert=True)
                 
                 async with get_user_lock(t_uid):
-                    prev_row = cur.execute("SELECT balance FROM users WHERE user_id=?", (t_uid,)).fetchone()
-                    prev_bal = prev_row[0] if prev_row else 0
-                    update_balance(t_uid, amt)
-                    cur.execute("UPDATE deposits SET status='approved', amount=? WHERE id=?", (amt, dep_id))
-                    cur.execute("UPDATE users SET total_deposited = total_deposited + ? WHERE user_id=?", (amt, t_uid))
-                    db.commit()
+                    if mongo_ready:
+                        user = get_user_doc(t_uid)
+                        prev_bal = int(user.get("balance", 0) or 0) if user else 0
+                        if update_deposit(dep_id, {"status": "approved", "amount": amt}, "pending") is None:
+                            return await e.edit(f"{P_WARN} Already processed.")
+                        update_user_balance(t_uid, amt)
+                        increment_user_field(t_uid, "total_deposited", amt)
+                    else:
+                        prev_row = cur.execute("SELECT balance FROM users WHERE user_id=?", (t_uid,)).fetchone()
+                        prev_bal = prev_row[0] if prev_row else 0
+                        update_balance(t_uid, amt)
+                        cur.execute("UPDATE deposits SET status='approved', amount=? WHERE id=?", (amt, dep_id))
+                        cur.execute("UPDATE users SET total_deposited = total_deposited + ? WHERE user_id=?", (amt, t_uid))
+                        db.commit()
                     
                 await process_referral_bonus(t_uid, amt)
                 await e.edit(f"{PE_CHECK} <b>APPROVED {P_INR}{amt} TO {t_uid} (Custom Amount)</b>")
@@ -3852,19 +4611,30 @@ async def handle_callback_query(e):
         elif data.startswith("dep_acc|") and has_perm(uid, 'p_bal'):
             p = data.split("|")
             dep_id, t_uid, method, a_type = p[1], int(p[2]), p[3], p[4]
-            row = cur.execute("SELECT status FROM deposits WHERE id=?", (dep_id,)).fetchone()
+            if mongo_ready:
+                dep_doc = get_mongo_deposit(dep_id)
+                row = (dep_doc.get("status"),) if dep_doc else None
+            else:
+                row = cur.execute("SELECT status FROM deposits WHERE id=?", (dep_id,)).fetchone()
             if not row or row[0] != 'pending': return await e.edit(f"{P_WARN} Already processed.")
             
             if a_type == "exact":
                 amt = int(p[5]) 
                 async with get_user_lock(t_uid):
-                    prev_row = cur.execute("SELECT balance FROM users WHERE user_id=?", (t_uid,)).fetchone()
-                    prev_bal = prev_row[0] if prev_row else 0
-                    update_balance(t_uid, amt)
-                    
-                    cur.execute("UPDATE deposits SET status='approved', amount=? WHERE id=?", (amt, dep_id))
-                    cur.execute("UPDATE users SET total_deposited = total_deposited + ? WHERE user_id=?", (amt, t_uid))
-                    db.commit()
+                    if mongo_ready:
+                        user = get_user_doc(t_uid)
+                        prev_bal = int(user.get("balance", 0) or 0) if user else 0
+                        if update_deposit(dep_id, {"status": "approved", "amount": amt}, "pending") is None:
+                            return await e.edit(f"{P_WARN} Already processed.")
+                        update_user_balance(t_uid, amt)
+                        increment_user_field(t_uid, "total_deposited", amt)
+                    else:
+                        prev_row = cur.execute("SELECT balance FROM users WHERE user_id=?", (t_uid,)).fetchone()
+                        prev_bal = prev_row[0] if prev_row else 0
+                        update_balance(t_uid, amt)
+                        cur.execute("UPDATE deposits SET status='approved', amount=? WHERE id=?", (amt, dep_id))
+                        cur.execute("UPDATE users SET total_deposited = total_deposited + ? WHERE user_id=?", (amt, t_uid))
+                        db.commit()
                 
                 await process_referral_bonus(t_uid, amt)
                 
@@ -3881,7 +4651,11 @@ async def handle_callback_query(e):
         elif data.startswith("dep_rej|") and has_perm(uid, 'p_bal'):
             p = data.split("|")
             dep_id, t_uid = p[1], int(p[2])
-            row = cur.execute("SELECT status FROM deposits WHERE id=?", (dep_id,)).fetchone()
+            if mongo_ready:
+                dep_doc = get_mongo_deposit(dep_id)
+                row = (dep_doc.get("status"),) if dep_doc else None
+            else:
+                row = cur.execute("SELECT status FROM deposits WHERE id=?", (dep_id,)).fetchone()
             if not row or row[0] != 'pending': return await e.edit(f"{P_WARN} Already processed.")
             admin_dep_state[uid] = {'target_uid': t_uid, 'dep_id': dep_id, 'step': 'wait_reason', 'msg_id': e.message.id}
             await bot.send_message(uid, f"{P_WARN} Reply to this message with the REASON for rejecting user <code>{t_uid}</code>:")
@@ -3913,5 +4687,13 @@ async def main():
 
 if __name__ == '__main__':
     bot.start(bot_token=BOT_TOKEN)
+    if mongo_ready:
+        try:
+            if persist_client_session("bot", bot, session_name, "bot"):
+                logger.info("MongoDB bot session persistence verified")
+            else:
+                logger.warning("MongoDB bot session persistence could not be verified")
+        except Exception as exc:
+            logger.warning("MongoDB bot session persistence failed: %s", type(exc).__name__)
     loop = asyncio.get_event_loop()
     loop.run_until_complete(main())
