@@ -295,7 +295,7 @@ def stock_row_to_doc(row):
 
 def upsert_stock_doc_to_mongo(doc):
     collection = mongo_inventory_collection()
-    if not collection or not doc or not doc.get("phone"):
+    if collection is None or not doc or not doc.get("phone"):
         return False
     try:
         collection.update_one({"phone": doc["phone"]}, {"$set": doc}, upsert=True)
@@ -307,7 +307,7 @@ def upsert_stock_doc_to_mongo(doc):
 
 def set_stock_available_in_mongo(phone, available):
     collection = mongo_inventory_collection()
-    if not collection or not phone:
+    if collection is None or not phone:
         return False
     try:
         result = collection.update_one({"phone": phone}, {"$set": {"available": 1 if available else 0}}, upsert=False)
