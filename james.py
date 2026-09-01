@@ -2418,7 +2418,7 @@ async def process_purchase(event, country, year_str, price_str, category=None, d
     except Exception:
         async with get_user_lock(uid):
             if mongo_ready:
-                remove_stock_from_mongo(phone)
+                set_stock_available_in_mongo(phone, True)
             if mongo_ready:
                 update_user_balance(uid, final_price)
                 record_refund(uid, final_price, phone, "invalid_account")
@@ -2427,9 +2427,6 @@ async def process_purchase(event, country, year_str, price_str, category=None, d
                 cur.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (final_price, uid))
                 db.commit()
         await client.disconnect()
-        if mongo_ready:
-            delete_persisted_session(f"account:{phone}")
-        delete_session_files(sess)
         return await event.edit(f"{P_NO} <b>Account Invalid.</b> Money refunded. Try buying another.")
 
     msg = (f"{PE_LIGHTNING} <b>Order Active!</b>\n\n"
