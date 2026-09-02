@@ -1108,8 +1108,18 @@ custom_dep_amt = {}
 pending_utr = {}        
 broadcast_drafts = {}
 broadcast_jobs = {}
+background_tasks = set()
 
 user_locks = {}
+
+
+def create_background_task(coro):
+    """Track application tasks so they can be cancelled during shutdown."""
+    task = asyncio.create_task(coro)
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+    return task
+
 
 def get_user_lock(uid):
     if uid not in user_locks:
@@ -1241,21 +1251,11 @@ try:
         migrate_sqlite_terms_to_mongo()
         primary_stats = migrate_sqlite_primary_domains_to_mongo()
         logger.info("MongoDB primary-domain migration complete: %s", primary_stats)
-        session_stats = asyncio.get_event_loop().run_until_complete(migrate_local_sessions_to_mongo())
-        logger.info(
-            "MongoDB session migration complete: found=%s migrated=%s skipped=%s",
-            session_stats["found"], session_stats["migrated"], session_stats["skipped"],
-        )
 except Exception as exc:
     logger.warning("MongoDB migration error: %s", exc)
 
 bot_session_string = get_persisted_session("bot")
-bot = TelegramClient(
-    StringSession(bot_session_string) if bot_session_string else session_name,
-    API_ID,
-    API_HASH,
-)
-bot.parse_mode = 'html'
+bot = None
 
 # ================= HELPER FUNCTIONS =================
 def is_bot_online():
@@ -2446,7 +2446,7 @@ async def process_purchase(event, country, year_str, price_str, category=None, d
         'paid': False, 'price': final_price, 'country': country, 'year': actual_year, 
         'c_icon': c_icon, 'twofa': twofa_pass, 'msg_id': sent_msg.id
     }
-    asyncio.create_task(auto_otp_task(phone))
+    create_background_task(auto_otp_task(phone))
 
 async def auto_otp_task(phone):
     if phone not in active_orders: return
@@ -3356,7 +3356,7 @@ async def admin_actions(event):
             return await event.answer("Broadcast is already running.", alert=True)
         draft = broadcast_drafts[owner_id]
         await event.answer("Broadcast started.", alert=True)
-        asyncio.create_task(run_broadcast(owner_id, chat, draft))
+        create_background_task(run_broadcast(owner_id, chat, draft))
         return
 
     if action_data.startswith("bcast_cancel|"):
@@ -4082,7 +4082,6 @@ async def admin_actions(event):
         except Exception as e: await conv.send_message(f"{P_NO} Error: {e}")
 
 # ================= CORE EVENT ROUTERS =================
-@bot.on(events.NewMessage(pattern=r"(?i)^/start"))
 async def handle_start(e):
     try:
         uid = e.sender_id
@@ -4130,7 +4129,6 @@ async def handle_start(e):
     except Exception as ex: 
         print(f"Start Error: {ex}")
 
-@bot.on(events.NewMessage())
 async def handle_all_messages(e):
     try:
         uid = e.sender_id
@@ -4373,7 +4371,6 @@ async def handle_all_messages(e):
 
     except Exception as ex: print(f"Message Error: {ex}")
 
-@bot.on(events.CallbackQuery)
 async def handle_callback_query(e):
     try:
         uid = e.sender_id
@@ -4661,36 +4658,79 @@ async def handle_callback_query(e):
 
     except Exception as ex: print(f"Callback Error: {ex}")
 
-async def main():
-    port = int(os.getenv("PORT", "10000"))
-    app = web.Application()
-    app.router.add_get("/", lambda request: web.Response(text="OK"))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    print(f"✅ Health server listening on 0.0.0.0:{port}")
-
-    print("=" * 50)
-    print("✅ ULTIMATE ADVANCED HTML BOT STARTED SUCCESSFULLY")
-    print("=" * 50)
-    print(f"✅ Admins: {ADMIN_IDS}")
-    print(f"✅ Support: @{SUPPORT_USERNAME_1} & @{SUPPORT_USERNAME_2}")
-    print("=" * 50)
+async def main_async():
+    runner = None
     try:
+        # Keep async startup work on the same loop as the Telegram client.
+        if mongo_ready:
+            try:
+                session_stats = await migrate_local_sessions_to_mongo()
+                logger.info(
+                    "MongoDB session migration complete: found=%s migrated=%s skipped=%s",
+                    session_stats["found"], session_stats["migrated"], session_stats["skipped"],
+                )
+            except Exception as exc:
+                logger.warning("MongoDB session migration error: %s", exc)
+
+        global bot
+        bot = TelegramClient(
+            StringSession(bot_session_string) if bot_session_string else session_name,
+            API_ID,
+            API_HASH,
+        )
+        bot.parse_mode = 'html'
+        bot.add_event_handler(handle_start, events.NewMessage(pattern=r"(?i)^/start"))
+        bot.add_event_handler(handle_all_messages, events.NewMessage())
+        bot.add_event_handler(handle_callback_query, events.CallbackQuery)
+
+        await bot.start(bot_token=BOT_TOKEN)
+        if mongo_ready:
+            try:
+                if persist_client_session("bot", bot, session_name, "bot"):
+                    logger.info("MongoDB bot session persistence verified")
+                else:
+                    logger.warning("MongoDB bot session persistence could not be verified")
+            except Exception as exc:
+                logger.warning("MongoDB bot session persistence failed: %s", type(exc).__name__)
+
+        port = int(os.getenv("PORT", "10000"))
+        app = web.Application()
+        app.router.add_get("/", lambda request: web.Response(text="OK"))
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        print(f"✅ Health server listening on 0.0.0.0:{port}")
+
+        print("=" * 50)
+        print("✅ ULTIMATE ADVANCED HTML BOT STARTED SUCCESSFULLY")
+        print("=" * 50)
+        print(f"✅ Admins: {ADMIN_IDS}")
+        print(f"✅ Support: @{SUPPORT_USERNAME_1} & @{SUPPORT_USERNAME_2}")
+        print("=" * 50)
         await bot.run_until_disconnected()
     finally:
-        await runner.cleanup()
+        pending_tasks = [task for task in background_tasks if not task.done()]
+        for task in pending_tasks:
+            task.cancel()
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
+        background_tasks.clear()
+
+        for order in list(active_orders.values()):
+            client = order.get("client")
+            if client is not None:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+        active_orders.clear()
+
+        if runner is not None:
+            await runner.cleanup()
+        if bot.is_connected():
+            await bot.disconnect()
+
 
 if __name__ == '__main__':
-    bot.start(bot_token=BOT_TOKEN)
-    if mongo_ready:
-        try:
-            if persist_client_session("bot", bot, session_name, "bot"):
-                logger.info("MongoDB bot session persistence verified")
-            else:
-                logger.warning("MongoDB bot session persistence could not be verified")
-        except Exception as exc:
-            logger.warning("MongoDB bot session persistence failed: %s", type(exc).__name__)
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    asyncio.run(main_async())
